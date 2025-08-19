@@ -1,0 +1,20 @@
+id: webfetch
+name: webfetch
+description: Fetch a URL over HTTP(S) (OpenCode-compatible)
+type_id: python
+manipulations: []
+syntax_formats_supported: [native_function_calling]
+preferred_formats: [native_function_calling]
+parameters:
+  - name: url
+    type: string
+    description: URL to fetch
+    required: true
+execution:
+  blocking: false
+provider_routing:
+  openai:
+    native_primary: false
+
+
+
