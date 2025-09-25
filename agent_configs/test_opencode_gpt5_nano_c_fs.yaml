@@ -9,7 +9,7 @@ model:
   id: openrouter/openai/gpt-5-nano
 
 prompt:
-  system: opencode/packages/opencode/src/session/prompt/initialize.txt
+  system: implementations/system_prompts/default.md
   mode: per_turn_append
   completion_sentinel: ">>>>>> END RESPONSE"
 

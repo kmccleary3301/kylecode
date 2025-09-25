@@ -8,11 +8,14 @@ from pathlib import Path
 from typing import Any, Dict
 import yaml
 
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+
+
 import ray
 from dotenv import load_dotenv
 
-from agent_llm_openai import OpenAIConductor
-from sandbox_virtualized import SandboxFactory, DeploymentMode
+from agentic_coder_prototype.agent_llm_openai import OpenAIConductor
+from kylecode.sandbox_virtualized import SandboxFactory, DeploymentMode
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("test_agent.yaml")
@@ -41,26 +44,29 @@ def main():
         sys.exit(1)
     cfg = _load_config(cfg_path)
 
-    # Resolve paths relative to config location
-    base = cfg_path.parent
+    # Resolve all paths relative to project root, not config directory
+    project_root = Path(__file__).parent
+    
+    # Workspace path
     workspace = Path(cfg.get("workspace", "./agent_ws"))
     if not workspace.is_absolute():
-        workspace = (base / workspace).resolve()
+        workspace = (project_root / workspace).resolve()
 
+    # Output paths should also be relative to project root
     out_json = cfg.get("output", {}).get("json", "./session_out.json")
     out_md = cfg.get("output", {}).get("markdown")
-    out_json_path = (base / out_json).resolve() if not Path(out_json).is_absolute() else Path(out_json)
-    out_md_path = (base / out_md).resolve() if out_md and not Path(out_md).is_absolute() else (Path(out_md) if out_md else None)
+    out_json_path = (project_root / out_json).resolve() if not Path(out_json).is_absolute() else Path(out_json)
+    out_md_path = (project_root / out_md).resolve() if out_md and not Path(out_md).is_absolute() else (Path(out_md) if out_md else None)
 
     model_id = cfg.get("model", {}).get("id", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
     tool_prompt_mode = cfg.get("prompt", {}).get("mode", "system_once")
     completion_sentinel = cfg.get("prompt", {}).get("completion_sentinel", ">>>>>> END RESPONSE")
 
     system_path = cfg.get("prompt", {}).get("system")
-    system_text = _read_text_file((base / system_path).resolve()) if system_path else _read_text_file(Path(__file__).with_name("SYSTEM_PROMPT.md"))
+    system_text = _read_text_file((project_root / system_path).resolve()) if system_path else _read_text_file(Path(__file__).with_name("SYSTEM_PROMPT.md"))
 
     task_file = cfg.get("task", {}).get("file")
-    user_text = _read_text_file((base / task_file).resolve()) if task_file else ""
+    user_text = _read_text_file((project_root / task_file).resolve()) if task_file else ""
 
     # Options
     stream_responses = bool(cfg.get("limits", {}).get("stream_responses", False))
@@ -117,7 +123,7 @@ def main():
             }
             defs_dir = (agent_config.get("tools", {}) or {}).get("defs_dir")
             if defs_dir:
-                resolved_defs = str((base / defs_dir).resolve()) if not os.path.isabs(str(defs_dir)) else str(defs_dir)
+                resolved_defs = str((project_root / defs_dir).resolve()) if not os.path.isabs(str(defs_dir)) else str(defs_dir)
                 agent_config.setdefault("tools", {})["defs_dir"] = resolved_defs
             agent = OpenAIConductor.options(name=f"oa-{uuid.uuid4()}").remote(
                 workspace=str(ws), 
@@ -147,7 +153,7 @@ def main():
         }
         defs_dir = (agent_config.get("tools", {}) or {}).get("defs_dir")
         if defs_dir:
-            resolved_defs = str((base / defs_dir).resolve()) if not os.path.isabs(str(defs_dir)) else str(defs_dir)
+            resolved_defs = str((project_root / defs_dir).resolve()) if not os.path.isabs(str(defs_dir)) else str(defs_dir)
             agent_config.setdefault("tools", {})["defs_dir"] = resolved_defs
         agent = OpenAIConductor.options(name=f"oa-{uuid.uuid4()}").remote(
             workspace=str(ws), 

@@ -11,10 +11,29 @@ Provides provider-specific tool schema translation and native tool calling detec
 from typing import Dict, Any, List, Optional, Tuple
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass
+class ProviderDescriptor:
+    """Describes how to communicate with a specific provider runtime."""
+
+    provider_id: str
+    runtime_id: str
+    default_api_variant: str
+    supports_native_tools: bool
+    supports_streaming: bool
+    supports_reasoning_traces: bool
+    supports_cache_control: bool
+    tool_schema_format: str
+    base_url: Optional[str]
+    api_key_env: str
+    default_headers: Dict[str, str]
 
 
 class ProviderConfig:
     """Configuration for a specific provider"""
+
     def __init__(
         self,
         provider_id: str,
@@ -22,7 +41,12 @@ class ProviderConfig:
         tool_schema_format: str = "openai",  # openai, anthropic, google
         base_url: Optional[str] = None,
         api_key_env: str = "OPENAI_API_KEY",
-        default_headers: Optional[Dict[str, str]] = None
+        default_headers: Optional[Dict[str, str]] = None,
+        runtime_id: str = "openai_chat",
+        default_api_variant: str = "chat",
+        supports_streaming: bool = True,
+        supports_reasoning_traces: bool = False,
+        supports_cache_control: bool = False,
     ):
         self.provider_id = provider_id
         self.supports_native_tools = supports_native_tools
@@ -30,6 +54,33 @@ class ProviderConfig:
         self.base_url = base_url
         self.api_key_env = api_key_env
         self.default_headers = default_headers or {}
+        self.runtime_id = runtime_id
+        self.default_api_variant = default_api_variant
+        self.supports_streaming = supports_streaming
+        self.supports_reasoning_traces = supports_reasoning_traces
+        self.supports_cache_control = supports_cache_control
+
+    def to_descriptor(self, supports_native_override: Optional[bool] = None) -> ProviderDescriptor:
+        """Convert config to runtime descriptor."""
+
+        supports_native = (
+            self.supports_native_tools
+            if supports_native_override is None
+            else supports_native_override
+        )
+        return ProviderDescriptor(
+            provider_id=self.provider_id,
+            runtime_id=self.runtime_id,
+            default_api_variant=self.default_api_variant,
+            supports_native_tools=supports_native,
+            supports_streaming=self.supports_streaming,
+            supports_reasoning_traces=self.supports_reasoning_traces,
+            supports_cache_control=self.supports_cache_control,
+            tool_schema_format=self.tool_schema_format,
+            base_url=self.base_url,
+            api_key_env=self.api_key_env,
+            default_headers=dict(self.default_headers or {}),
+        )
 
 
 class ToolSchemaTranslator(ABC):
@@ -96,7 +147,12 @@ class ProviderRouter:
                 provider_id="openai",
                 supports_native_tools=True,
                 tool_schema_format="openai",
-                api_key_env="OPENAI_API_KEY"
+                api_key_env="OPENAI_API_KEY",
+                runtime_id="openai_chat",
+                default_api_variant="chat",
+                supports_streaming=True,
+                supports_reasoning_traces=True,
+                supports_cache_control=False,
             ),
             "openrouter": ProviderConfig(
                 provider_id="openrouter",
@@ -107,13 +163,23 @@ class ProviderRouter:
                 default_headers={
                     "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", ""),
                     "X-Title": os.getenv("OPENROUTER_APP_TITLE", "Ray SCE Agent")
-                }
+                },
+                runtime_id="openrouter_chat",
+                default_api_variant="chat",
+                supports_streaming=True,
+                supports_reasoning_traces=True,
+                supports_cache_control=False,
             ),
             "anthropic": ProviderConfig(
                 provider_id="anthropic",
                 supports_native_tools=True,
                 tool_schema_format="anthropic",
-                api_key_env="ANTHROPIC_API_KEY"
+                api_key_env="ANTHROPIC_API_KEY",
+                runtime_id="anthropic_messages",
+                default_api_variant="messages",
+                supports_streaming=True,
+                supports_reasoning_traces=True,
+                supports_cache_control=True,
             )
         }
         
@@ -162,7 +228,7 @@ class ProviderRouter:
     def get_provider_config(self, model_id: str) -> Tuple[ProviderConfig, str, bool]:
         """
         Get provider configuration for a model ID.
-        
+
         Returns: (config, actual_model_id, supports_native_tools_for_this_model)
         """
         provider, actual_model, routing_path = self.parse_model_id(model_id)
@@ -173,9 +239,16 @@ class ProviderRouter:
         if provider == "openrouter" and routing_path == "routed":
             # Check if this is an OpenAI model through OpenRouter
             supports_native = actual_model.startswith("openai/")
-        
+
         return config, actual_model, supports_native
-    
+
+    def get_runtime_descriptor(self, model_id: str) -> Tuple[ProviderDescriptor, str]:
+        """Return a provider runtime descriptor and resolved model ID."""
+
+        config, actual_model, supports_native = self.get_provider_config(model_id)
+        descriptor = config.to_descriptor(supports_native_override=supports_native)
+        return descriptor, actual_model
+
     def get_tool_translator(self, model_id: str) -> ToolSchemaTranslator:
         """Get appropriate tool schema translator for a model"""
         provider, _, _ = self.parse_model_id(model_id)

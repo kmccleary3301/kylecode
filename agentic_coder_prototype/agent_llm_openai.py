@@ -4,35 +4,58 @@ import json
 import os
 import shutil
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
+from types import SimpleNamespace
 
 import ray
 
-from ..sandbox_v2 import DevSandboxV2
-from .tool_calling.core import ToolDefinition, ToolParameter
-from .tool_calling.pythonic02 import Pythonic02Dialect
-from .tool_calling.pythonic_inline import PythonicInlineDialect
-from .tool_calling.aider_diff import AiderDiffDialect
-from .tool_calling.unified_diff import UnifiedDiffDialect
-from .tool_calling.opencode_patch import OpenCodePatchDialect
-from .tool_calling.composite import CompositeToolCaller
-from .tool_calling.bash_block import BashBlockDialect
-from .tool_calling.dialect_manager import DialectManager
-from .tool_calling.enhanced_executor import EnhancedToolExecutor
-from .tool_calling.tool_yaml_loader import load_yaml_tools
-from .tool_calling.provider_schema import build_openai_tools_schema_from_yaml, filter_tools_for_provider_native
-from .tool_calling.system_prompt_compiler import get_compiler
-from .tool_calling.enhanced_config_validator import EnhancedConfigValidator
-from .tool_calling.sequential_executor import SequentialToolExecutor
+from kylecode.sandbox_v2 import DevSandboxV2
+from kylecode.sandbox_virtualized import SandboxFactory, DeploymentMode
+from .core.core import ToolDefinition, ToolParameter
+from .dialects.pythonic02 import Pythonic02Dialect
+from .dialects.pythonic_inline import PythonicInlineDialect
+from .dialects.aider_diff import AiderDiffDialect
+from .dialects.unified_diff import UnifiedDiffDialect
+from .dialects.opencode_patch import OpenCodePatchDialect
+from .dialects.yaml_command import YAMLCommandDialect
+from .execution.composite import CompositeToolCaller
+from .dialects.bash_block import BashBlockDialect
+from .execution.dialect_manager import DialectManager
+from .execution.enhanced_executor import EnhancedToolExecutor
+from .execution.agent_executor import AgentToolExecutor
+from .compilation.tool_yaml_loader import load_yaml_tools
+from .compilation.system_prompt_compiler import get_compiler
+from .compilation.enhanced_config_validator import EnhancedConfigValidator
 from .provider_routing import provider_router
 from .provider_adapters import provider_adapter_manager
+from .provider_runtime import (
+    provider_registry,
+    ProviderRuntimeContext,
+    ProviderResult,
+    ProviderMessage,
+    ProviderRuntimeError,
+)
+from .state.session_state import SessionState
+from .state.completion_detector import CompletionDetector
+from .messaging.message_formatter import MessageFormatter
+from .messaging.markdown_logger import MarkdownLogger
+from .error_handling.error_handler import ErrorHandler
+from .monitoring.telemetry import TelemetryLogger
+from .logging_v2 import LoggerV2Manager
+from .logging_v2.api_recorder import APIRequestRecorder
+from .logging_v2.prompt_logger import PromptArtifactLogger
+from .logging_v2.markdown_transcript import MarkdownTranscriptWriter
+from .logging_v2.provider_native_logger import ProviderNativeLogger
+from .utils.local_ray import LocalActorProxy, identity_get
 
-try:
-    from openai import OpenAI  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    OpenAI = None  # type: ignore
 
+def compute_tool_prompt_mode(tool_prompt_mode: str, will_use_native_tools: bool, config: Dict[str, Any]) -> str:
+    """Pure helper for testing prompt mode adjustment (module-level)."""
+    if will_use_native_tools:
+        suppress_prompts = bool((config or {}).get("provider_tools", {}).get("suppress_prompts", False))
+        return "none" if suppress_prompts else "per_turn_append"
+    return tool_prompt_mode
 
 def _tools_schema() -> List[Dict[str, Any]]:
     return [
@@ -120,24 +143,203 @@ def _dump_tool_defs(tool_defs: List[ToolDefinition]) -> List[Dict[str, Any]]:
 
 @ray.remote
 class OpenAIConductor:
-    def __init__(self, workspace: str, image: str = "python-dev:latest", config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, workspace: str, image: str = "python-dev:latest", config: Optional[Dict[str, Any]] = None, *, local_mode: bool = False) -> None:
+        # Resolve workspace from v2 config if provided
+        cfg_ws = None
+        if config:
+            try:
+                cfg_ws = (config.get("workspace", {}) or {}).get("root")
+            except Exception:
+                cfg_ws = None
+        effective_ws = cfg_ws or workspace
+        # Ensure we start from a clean workspace so each run works from a fresh clone
+        effective_ws = str(self._prepare_workspace(effective_ws))
+        # Choose virtualization mode based on workspace.mirror.mode
+        mirror_cfg = ((config or {}).get("workspace", {}) or {}).get("mirror", {})
+        mirror_mode = str(mirror_cfg.get("mode", "development")).lower()
+        use_virtualized = mirror_cfg.get("enabled", True)
+        
+        
+        print("WORKSPACE", effective_ws)
+        print("MIRROR CFG", mirror_cfg)
+        
         # Local-host fallback unless explicitly using docker by env
-        self.sandbox = DevSandboxV2.options(name=f"oa-sb-{uuid.uuid4()}").remote(image=image, workspace=workspace)
-        self.workspace = workspace
+        self.local_mode = bool(local_mode)
+        self._ray_get = ray.get if not self.local_mode else identity_get
+
+        self.using_virtualized = bool(use_virtualized) and not self.local_mode
+        if self.using_virtualized:
+            try:
+                mode = DeploymentMode(mirror_mode) if mirror_mode in (m.value for m in DeploymentMode) else DeploymentMode.DEVELOPMENT
+            except Exception:
+                mode = DeploymentMode.DEVELOPMENT
+            factory = SandboxFactory()
+            vsb, session_id = factory.create_sandbox(mode, {"runtime": {"image": image}, "workspace": effective_ws})
+            self.sandbox = vsb
+        elif self.local_mode:
+            dev_cls = DevSandboxV2.__ray_metadata__.modified_class
+            dev_impl = dev_cls(image=image, session_id=f"local-{uuid.uuid4()}", workspace=effective_ws, lsp_actor=None)
+            self.sandbox = LocalActorProxy(dev_impl)
+        else:
+            self.sandbox = DevSandboxV2.options(name=f"oa-sb-{uuid.uuid4()}").remote(image=image, workspace=effective_ws)
+
+        self.workspace = effective_ws
         self.image = image
         self.config = config or {}
         
-        # Initialize enhanced tools and configuration validator
-        self.dialect_manager = DialectManager(self.config)
+        # Initialize components
+        self._initialize_dialect_manager()
+        self._initialize_yaml_tools()
+        self._initialize_config_validator()
+        self._initialize_enhanced_executor()
+
+        # Initialize Logging v2 (safe no-op if disabled/missing config)
+        self.logger_v2 = LoggerV2Manager(self.config)
+        try:
+            # Use only workspace basename for logging session id to avoid path tokens
+            run_dir = self.logger_v2.start_run(session_id=os.path.basename(os.path.normpath(self.workspace)))
+        except Exception:
+            run_dir = ""
+        self.api_recorder = APIRequestRecorder(self.logger_v2)
+        self.prompt_logger = PromptArtifactLogger(self.logger_v2)
+        self.md_writer = MarkdownTranscriptWriter()
+        self.provider_logger = ProviderNativeLogger(self.logger_v2)
         
-        # Load YAML-defined tools and manipulations map for routing/validation
+        # Initialize extracted modules
+        self.message_formatter = MessageFormatter(self.workspace)
+        self.agent_executor = AgentToolExecutor(self.config, self.workspace)
+        self.agent_executor.set_enhanced_executor(self.enhanced_executor)
+        self.agent_executor.set_config_validator(self.config_validator)
+
+    def _prepare_workspace(self, workspace: str) -> Path:
+        """Ensure the workspace directory exists and is empty before use."""
+        try:
+            path = Path(workspace)
+        except Exception:
+            path = Path(str(workspace))
+        try:
+            path = path if path.is_absolute() else (Path.cwd() / path)
+            path = path.resolve()
+        except Exception:
+            # Fallback: use absolute() best-effort without strict resolution
+            try:
+                path = path.absolute()
+            except Exception:
+                pass
+        try:
+            if path.exists():
+                shutil.rmtree(path)
+        except Exception:
+            # If cleanup fails we still attempt to proceed with a fresh directory
+            pass
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _initialize_dialect_manager(self):
+        """Initialize enhanced tools and configuration validator"""
+        self.dialect_manager = DialectManager(self.config)
+    
+    # ===== Agent Schema v2 helpers =====
+    def _resolve_active_mode(self) -> Optional[str]:
+        try:
+            seq = (self.config.get("loop", {}) or {}).get("sequence") or []
+            features = self.config.get("features", {}) or {}
+            for step in seq:
+                if not isinstance(step, dict):
+                    continue
+                if "if" in step and "then" in step:
+                    cond = str(step.get("if"))
+                    then = step.get("then") or {}
+                    ok = False
+                    if cond.startswith("features."):
+                        key = cond.split("features.", 1)[1]
+                        ok = bool(features.get(key))
+                    if ok and isinstance(then, dict) and then.get("mode"):
+                        return str(then.get("mode"))
+                if step.get("mode"):
+                    return str(step.get("mode"))
+        except Exception:
+            pass
+        try:
+            modes = self.config.get("modes", []) or []
+            if modes and isinstance(modes, list):
+                name = modes[0].get("name")
+                if name:
+                    return str(name)
+        except Exception:
+            pass
+        return None
+
+    def _get_mode_config(self, mode_name: Optional[str]) -> Dict[str, Any]:
+        if not mode_name:
+            return {}
+        try:
+            for m in self.config.get("modes", []) or []:
+                if m.get("name") == mode_name:
+                    return m
+        except Exception:
+            pass
+        return {}
+
+    def _filter_tools_by_mode(self, tool_defs: List[ToolDefinition], mode_cfg: Dict[str, Any]) -> List[ToolDefinition]:
+        try:
+            enabled = mode_cfg.get("tools_enabled")
+            disabled = mode_cfg.get("tools_disabled") or []
+            if not enabled and not disabled:
+                return tool_defs
+            enabled_set = set(enabled or [])
+            disabled_set = set(disabled)
+            out: List[ToolDefinition] = []
+            for t in tool_defs:
+                name = t.name
+                if name in disabled_set:
+                    continue
+                if enabled and "*" not in enabled_set and name not in enabled_set:
+                    continue
+                out.append(t)
+            return out or tool_defs
+        except Exception:
+            return tool_defs
+
+    def _apply_turn_strategy_from_loop(self) -> None:
+        try:
+            loop_ts = (self.config.get("loop", {}) or {}).get("turn_strategy") or {}
+            if loop_ts:
+                self.config.setdefault("turn_strategy", {})
+                self.config["turn_strategy"].update(loop_ts)
+        except Exception:
+            pass
+
+    def _prepare_concurrency_policy(self) -> Dict[str, Any]:
+        """Prepare a simple concurrency policy map from config for testing/logging."""
+        policy = self.config.get("concurrency", {}) or {}
+        groups = policy.get("groups", []) or []
+        tool_to_group: Dict[str, Dict[str, Any]] = {}
+        barrier_functions: set[str] = set()
+        try:
+            for g in groups:
+                match_tools = g.get("match_tools", []) or []
+                for tn in match_tools:
+                    tool_to_group[str(tn)] = {
+                        "name": g.get("name"),
+                        "max_parallel": int(g.get("max_parallel", 1) or 1),
+                        "barrier_after": g.get("barrier_after"),
+                    }
+                if g.get("barrier_after"):
+                    barrier_functions.add(str(g.get("barrier_after")))
+        except Exception:
+            pass
+        return {"tool_to_group": tool_to_group, "barrier_functions": barrier_functions}
+    
+    def _initialize_yaml_tools(self):
+        """Load YAML-defined tools and manipulations map for routing/validation"""
         try:
             # Allow overriding the YAML tool defs directory via config
-            defs_dir = (
-                (self.config.get("tools", {}) or {}).get("defs_dir")
-                or "implementations/tools/defs"
-            )
-            loaded = load_yaml_tools(defs_dir)
+            tools_cfg = (self.config.get("tools", {}) or {})
+            defs_dir = tools_cfg.get("defs_dir") or "implementations/tools/defs"
+            overlays = (tools_cfg.get("overlays") or [])
+            aliases = (tools_cfg.get("aliases") or {})
+            loaded = load_yaml_tools(defs_dir, overlays=overlays, aliases=aliases)
             self.yaml_tools = loaded.tools
             self.yaml_tool_manipulations = loaded.manipulations_by_id
         except Exception:
@@ -148,8 +350,9 @@ class OpenAIConductor:
             self.config.setdefault("yaml_tool_manipulations", self.yaml_tool_manipulations)
         except Exception:
             pass
-
-        # Initialize enhanced configuration validator
+    
+    def _initialize_config_validator(self):
+        """Initialize enhanced configuration validator"""
         enhanced_tools_config = self.config.get("tools", {}).get("registry")
         if enhanced_tools_config and os.path.exists("implementations/tools/enhanced_tools.yaml"):
             try:
@@ -161,14 +364,15 @@ class OpenAIConductor:
         
         # Initialize sequential executor for design decision implementation
         self.sequential_executor = None
-        
-        # Initialize enhanced executor if requested
+    
+    def _initialize_enhanced_executor(self):
+        """Initialize enhanced executor if requested"""
         enhanced_config = self.config.get("enhanced_tools", {})
         # If LSP integration is requested, wrap sandbox even if enhanced executor not enabled
         if enhanced_config.get("lsp_integration", {}).get("enabled", False):
             try:
-                from sandbox_lsp_integration import LSPEnhancedSandbox
-                self.sandbox = LSPEnhancedSandbox.remote(self.sandbox, workspace)
+                from kylecode.sandbox_lsp_integration import LSPEnhancedSandbox
+                self.sandbox = LSPEnhancedSandbox.remote(self.sandbox, self.workspace)
             except ImportError:
                 pass
         if enhanced_config.get("enabled", False) or enhanced_config.get("lsp_integration", {}).get("enabled", False):
@@ -176,8 +380,8 @@ class OpenAIConductor:
             sandbox_for_executor = self.sandbox
             if enhanced_config.get("lsp_integration", {}).get("enabled", False):
                 try:
-                    from sandbox_lsp_integration import LSPEnhancedSandbox
-                    sandbox_for_executor = LSPEnhancedSandbox.remote(self.sandbox, workspace)
+                    from kylecode.sandbox_lsp_integration import LSPEnhancedSandbox
+                    sandbox_for_executor = LSPEnhancedSandbox.remote(self.sandbox, self.workspace)
                 except ImportError:
                     pass  # LSP integration not available, use regular sandbox
             
@@ -222,16 +426,20 @@ class OpenAIConductor:
             return None
 
     def create_file(self, path: str) -> Dict[str, Any]:
-        return ray.get(self.sandbox.write_text.remote(path, ""))
+        return self._ray_get(self.sandbox.write_text.remote(path, ""))
 
     def read_file(self, path: str) -> Dict[str, Any]:
-        return ray.get(self.sandbox.read_text.remote(path))
+        return self._ray_get(self.sandbox.read_text.remote(path))
 
     def list_dir(self, path: str, depth: int = 1) -> Dict[str, Any]:
-        return ray.get(self.sandbox.ls.remote(path, depth))
+        # Always pass virtual paths when using VirtualizedSandbox; else pass normalized absolute
+        if getattr(self, 'using_virtualized', False):
+            return self._ray_get(self.sandbox.ls.remote(path, depth))
+        target = self._normalize_workspace_path(str(path))
+        return self._ray_get(self.sandbox.ls.remote(target, depth))
 
     def run_shell(self, command: str, timeout: Optional[int] = None) -> Dict[str, Any]:
-        stream = ray.get(self.sandbox.run.remote(command, timeout=timeout or 30, stream=True))
+        stream = self._ray_get(self.sandbox.run.remote(command, timeout=timeout or 30, stream=True))
         # Decode adaptive-encoded list materialized; last element is {"exit": code}
         exit_obj = stream[-1] if stream else {"exit": None}
         # Collect only string lines, drop adaptive markers (>>>>> ...)
@@ -246,221 +454,67 @@ class OpenAIConductor:
         return {"stdout": stdout, "exit": exit_obj.get("exit")}
 
     def vcs(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        return ray.get(self.sandbox.vcs.remote(request))
+        return self._ray_get(self.sandbox.vcs.remote(request))
 
     def _normalize_workspace_path(self, path_in: str) -> str:
-        ws = os.path.normpath(self.workspace)
+        """Normalize a tool-supplied path so it stays within the workspace root."""
+        ws_path = Path(self.workspace).resolve()
         if not path_in:
-            return ws
-        if os.path.isabs(path_in):
-            return os.path.normpath(path_in)
-        base = os.path.basename(ws)
-        for sep in (os.sep, "/", "\\"):
-            marker = base + sep
-            if marker in path_in:
-                tail = path_in.split(marker, 1)[1].lstrip("/\\")
-                return os.path.join(ws, tail)
-        if ws in path_in:
-            tail = path_in.split(ws, 1)[1].lstrip("/\\")
-            return os.path.join(ws, tail)
-        return os.path.join(ws, path_in)
-    
-    def _is_tool_failure(self, tool_name: str, result: Dict[str, Any]) -> bool:
-        """Check if a tool call failed based on its result"""
-        # Check for explicit error
-        if result.get("error"):
-            return True
-        
-        # Check for explicit failure flag
-        if result.get("ok") is False:
-            return True
-        
-        # Check for bash command failure (non-zero exit code)
-        if tool_name == "run_shell" and result.get("exit", 0) != 0:
-            return True
-        
-        return False
-    
-    def _detect_completion_sota(self, msg_content: str, choice_finish_reason: str, tool_results: List[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        State-of-the-art completion detection using multiple methods.
-        Returns: {"completed": bool, "method": str, "confidence": float, "reason": str}
-        """
-        completion_result = {"completed": False, "method": "none", "confidence": 0.0, "reason": ""}
-        
-        # Check if mark_task_complete tool is available
-        mark_task_complete_available = True
-        if hasattr(self, 'config') and self.config:
-            tools_config = self.config.get("tools", {})
-            mark_task_complete_available = tools_config.get("mark_task_complete", True)
-        
-        # 1. TOOL-BASED COMPLETION (Primary - Highest Confidence)
-        if tool_results:
-            for result in tool_results:
-                if isinstance(result, dict) and result.get("action") == "complete":
-                    return {
-                        "completed": True, 
-                        "method": "tool_based", 
-                        "confidence": 1.0, 
-                        "reason": "mark_task_complete() called"
-                    }
-        
-        # 2. TEXT SENTINEL DETECTION (High Confidence - Enhanced when no tool completion)
-        if self.completion_config.get("enable_text_sentinels", True) and msg_content:
-            for sentinel in self.completion_config.get("text_sentinels", []):
-                if sentinel and sentinel in msg_content:
-                    # Boost confidence when tool completion is not available
-                    confidence = 0.95 if not mark_task_complete_available else 0.9
-                    return {
-                        "completed": True,
-                        "method": "text_sentinel", 
-                        "confidence": confidence,
-                        "reason": f"Sentinel detected: '{sentinel}'" + (
-                            " (boosted confidence - no tool completion)" if not mark_task_complete_available else ""
-                        )
-                    }
-        
-        # 3. PROVIDER FINISH REASON ANALYSIS (Medium Confidence)
-        if self.completion_config.get("enable_provider_signals", True) and choice_finish_reason:
-            if choice_finish_reason in ["stop", "end_turn", "length"]:
-                # Analyze content for completion indicators
-                success_score = 0
-                failure_score = 0
-                
-                if msg_content:
-                    content_lower = msg_content.lower()
-                    for keyword in self.completion_config.get("success_keywords", []):
-                        if keyword in content_lower:
-                            success_score += 1
-                    for keyword in self.completion_config.get("failure_keywords", []):
-                        if keyword in content_lower:
-                            failure_score += 1
-                
-                # Natural completion if strong success indicators (enhanced scoring when no tool completion)
-                required_score = 1 if not mark_task_complete_available else 2
-                if success_score >= required_score and failure_score == 0:
-                    confidence = 0.8 if not mark_task_complete_available else 0.7
-                    return {
-                        "completed": True,
-                        "method": "provider_natural",
-                        "confidence": confidence,
-                        "reason": f"Provider finish + success indicators (score: {success_score})" + (
-                            " (enhanced for no-tool mode)" if not mark_task_complete_available else ""
-                        )
-                    }
-        
-        # 4. NATURAL FINISH DETECTION (Lower Confidence)
-        if self.completion_config.get("enable_natural_finish", True) and msg_content:
-            # Look for natural completion patterns
-            content_lower = msg_content.lower()
-            natural_patterns = [
-                "task is complete", "implementation is done", "everything is working",
-                "all requirements met", "successfully implemented", "ready for use"
-            ]
-            
-            for pattern in natural_patterns:
-                if pattern in content_lower:
-                    # Enhanced confidence when no tool completion available
-                    confidence = 0.75 if not mark_task_complete_available else 0.6
-                    return {
-                        "completed": True,
-                        "method": "natural_language",
-                        "confidence": confidence,
-                        "reason": f"Natural completion pattern: '{pattern}'" + (
-                            " (enhanced for no-tool mode)" if not mark_task_complete_available else ""
-                        )
-                    }
-        
-        return completion_result
-    
-    def _format_tree_structure(self, tree_data: list[dict], prefix: str = "") -> str:
-        """Format tree structure for display"""
-        lines = []
-        for i, item in enumerate(tree_data):
-            is_last = i == len(tree_data) - 1
-            current_prefix = "└── " if is_last else "├── "
-            name = item["name"]
-            if item["is_dir"]:
-                name += "/"
-            lines.append(prefix + current_prefix + name)
-            
-            # Add children if present
-            if item.get("children"):
-                child_prefix = prefix + ("    " if is_last else "│   ")
-                child_lines = self._format_tree_structure(item["children"], child_prefix)
-                lines.append(child_lines)
-        
-        return "\n".join(lines)
-    
-    def _format_tool_output(self, tool_name: str, result: dict, args: dict) -> str:
-        """Format tool output in the new TOOL_OUTPUT format"""
-        if tool_name == "list_dir":
-            path = args.get("path", ".")
-            depth = args.get("depth", 1)
-            
-            if result.get("error"):
-                return f"<TOOL_OUTPUT tool=\"list_dir\" path=\"{path}\">\nError: {result['error']}\n</TOOL_OUTPUT>"
-            
-            if result.get("tree_format"):
-                # Tree structure format
-                tree_display = self._format_tree_structure(result.get("tree_structure", []))
-                return f"<TOOL_OUTPUT tool=\"list_dir\" path=\"{path}\" depth={depth}>\n{tree_display}\n</TOOL_OUTPUT>"
-            else:
-                # Simple list format
-                items = result.get("items", [])
-                items_display = "\n".join(items)
-                return f"<TOOL_OUTPUT tool=\"list_dir\" path=\"{path}\">\n{items_display}\n</TOOL_OUTPUT>"
-        
-        elif tool_name == "read_file":
-            path = args.get("path", "")
-            content = result.get("content", "")
-            # Virtualize path (remove workspace prefix)
-            rel_path = path.replace(self.workspace.rstrip("/"), "").lstrip("/")
-            if not rel_path:
-                rel_path = path
-            return f"<TOOL_OUTPUT tool=\"read_file\" file=\"{rel_path}\">\n{content}\n</TOOL_OUTPUT>"
-        
-        elif tool_name in ["create_file", "create_file_from_block", "apply_unified_patch", "apply_search_replace"]:
-            # File operation results with LSP integration
-            path = result.get("path", args.get("path", args.get("file_name", "unknown")))
-            rel_path = path.replace(self.workspace.rstrip("/"), "").lstrip("/") if isinstance(path, str) else "unknown"
-            
-            # Check for LSP diagnostics in result
-            lsp_feedback = result.get("lsp_feedback", "")
-            if lsp_feedback:
-                if "0 linter errors" in lsp_feedback:
-                    return f"<PATCH_RESULT file=\"{rel_path}\">\nFile successfully {'created' if 'create' in tool_name else 'patched'} with 0 linter errors.\n</PATCH_RESULT>"
-                else:
-                    return f"<PATCH_RESULT file=\"{rel_path}\">\nFile successfully {'created' if 'create' in tool_name else 'patched'}, but with linter errors:\n\n{lsp_feedback}\n</PATCH_RESULT>"
-            else:
-                # Fallback without LSP
-                return f"<PATCH_RESULT file=\"{rel_path}\">\nFile successfully {'created' if 'create' in tool_name else 'patched'} with 0 linter errors.\n</PATCH_RESULT>"
-        
-        elif tool_name == "run_shell":
-            stdout = result.get("stdout", "")
-            stderr = result.get("stderr", "")
-            exit_code = result.get("exit", 0)
-            
-            output_lines = []
-            if stdout:
-                output_lines.append(stdout.rstrip())
-            if stderr:
-                output_lines.append(f"stderr: {stderr.rstrip()}")
-            if exit_code != 0:
-                output_lines.append(f"exit code: {exit_code}")
-            
-            output_content = "\n".join(output_lines) if output_lines else "(no output)"
-            return f"<BASH_RESULT>\n{output_content}\n</BASH_RESULT>"
-        
-        elif tool_name == "mark_task_complete":
-            return f"<TOOL_OUTPUT tool=\"mark_task_complete\">\nTask marked as complete. Ending session.\n</TOOL_OUTPUT>"
-        
-        else:
-            # Fallback to JSON for unknown tools
-            try:
-                return json.dumps(result)
-            except Exception:
-                return f"TOOL {tool_name} OUTPUT"
+            return str(ws_path)
+
+        raw = str(path_in).strip()
+        if not raw:
+            return str(ws_path)
+
+        # Absolute paths: prefer workspace-relative when under the workspace
+        try:
+            abs_candidate = Path(raw)
+            if abs_candidate.is_absolute():
+                try:
+                    rel = abs_candidate.resolve(strict=False).relative_to(ws_path)
+                    return str((ws_path / rel).resolve(strict=False))
+                except Exception:
+                    return str(abs_candidate.resolve(strict=False))
+        except Exception:
+            pass
+
+        # Work with normalized string form for relative paths
+        normalized = raw.replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        if normalized in ("", "."):
+            return str(ws_path)
+
+        ws_name = ws_path.name
+        segments = [seg for seg in normalized.split("/") if seg and seg != "."]
+
+        # Strip duplicated workspace prefixes (agent_ws/.../agent_ws/...) lazily
+        while segments and segments[0] == ws_name:
+            segments.pop(0)
+
+        # Remove any embedded absolute workspace prefix fragments
+        ws_str_norm = str(ws_path).replace("\\", "/")
+        if ws_str_norm in normalized:
+            tail = normalized.split(ws_str_norm, 1)[1].lstrip("/\\")
+            segments = [seg for seg in tail.split("/") if seg and seg != "."]
+
+        # Collapse .. components so paths cannot escape the workspace
+        cleaned: List[str] = []
+        for seg in segments:
+            if seg == "..":
+                if cleaned:
+                    cleaned.pop()
+                continue
+            cleaned.append(seg)
+
+        candidate = ws_path.joinpath(*cleaned) if cleaned else ws_path
+        candidate = candidate.resolve(strict=False)
+        try:
+            candidate.relative_to(ws_path)
+        except ValueError:
+            # If resolution escaped the workspace, fall back to workspace root
+            return str(ws_path)
+        return str(candidate)
     
     def _exec_raw(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """Raw tool execution without enhanced features (for compatibility)"""
@@ -484,12 +538,12 @@ class OpenAIConductor:
             search_text = str(args.get("search", ""))
             replace_text = str(args.get("replace", ""))
             try:
-                exists = ray.get(self.sandbox.exists.remote(target))
+                exists = self._ray_get(self.sandbox.exists.remote(target))
             except Exception:
                 exists = False
             if not exists or search_text.strip() == "":
-                return ray.get(self.sandbox.write_text.remote(target, replace_text))
-            return ray.get(self.sandbox.edit_replace.remote(target, search_text, replace_text, 1))
+                return self._ray_get(self.sandbox.write_text.remote(target, replace_text))
+            return self._ray_get(self.sandbox.edit_replace.remote(target, search_text, replace_text, 1))
         if name == "apply_unified_patch":
             patch_text = str(args.get("patch", ""))
             return self.vcs({
@@ -505,77 +559,10 @@ class OpenAIConductor:
         if name == "create_file_from_block":
             path = self._normalize_workspace_path(str(args.get("file_name", "")))
             content = str(args.get("content", ""))
-            return ray.get(self.sandbox.write_text.remote(path, content))
+            return self._ray_get(self.sandbox.write_text.remote(path, content))
         if name == "mark_task_complete":
             return {"action": "complete"}
         return {"error": f"unknown tool {name}"}
-
-    def _write_snapshot(self, output_path: Optional[str], model: str, messages: List[Dict[str, Any]], transcript: List[Dict[str, Any]]) -> None:
-        if not output_path:
-            return
-        try:
-            diff = self.vcs({"action": "diff", "params": {"staged": False, "unified": 3}})
-        except Exception:
-            diff = {"ok": False, "data": {"diff": ""}}
-        
-        # Enhanced debugging information about tool usage and provider configuration
-        provider_cfg = self.config.get("provider_tools", {}) if hasattr(self, 'config') else {}
-        debug_info = {
-            "provider_tools_config": provider_cfg,
-            "tool_prompt_mode": getattr(self, 'last_tool_prompt_mode', 'unknown'),
-            "native_tools_enabled": bool(provider_cfg.get("use_native", False)),
-            "tools_suppressed": bool(provider_cfg.get("suppress_prompts", False)),
-            "yaml_tools_count": len(getattr(self, 'yaml_tools', [])),
-            "enhanced_executor_enabled": bool(getattr(self, 'enhanced_executor', None)),
-        }
-        
-        # Analyze messages for tool calling patterns
-        tool_analysis = {
-            "total_messages": len(messages),
-            "assistant_messages": len([m for m in messages if m.get("role") == "assistant"]),
-            "messages_with_native_tool_calls": len([m for m in messages if m.get("role") == "assistant" and m.get("tool_calls")]),
-            "messages_with_text_tool_calls": len([m for m in messages if m.get("role") == "assistant" and m.get("content") and "<TOOL_CALL>" in str(m.get("content", ""))]),
-            "tool_role_messages": len([m for m in messages if m.get("role") == "tool"]),
-        }
-        
-        snapshot = {
-            "workspace": self.workspace,
-            "image": self.image,
-            "model": model,
-            "messages": messages,
-            "transcript": transcript,
-            "diff": diff,
-            "debug_info": debug_info,
-            "tool_analysis": tool_analysis,
-        }
-        try:
-            outp = Path(output_path)
-            outp.parent.mkdir(parents=True, exist_ok=True)
-            outp.write_text(json.dumps(snapshot, indent=2))
-        except Exception:
-            pass
-
-    def _append_markdown(self, output_path: Optional[str], sections: List[Dict[str, str]]) -> None:
-        """
-        Append sections to a markdown log file. Each section is {"role": label, "content": text}.
-        Renders as bold role headings with blank lines around.
-        """
-        if not output_path:
-            return
-        try:
-            outp = Path(output_path)
-            outp.parent.mkdir(parents=True, exist_ok=True)
-            with outp.open("a", encoding="utf-8") as f:
-                for sec in sections:
-                    role = sec.get("role", "")
-                    content = sec.get("content", "")
-                    if not isinstance(content, str):
-                        content = str(content)
-                    f.write("\n\n**" + role + "**\n\n")
-                    f.write(content.rstrip("\n") + "\n")
-        except Exception:
-            # Best-effort only; ignore logging errors
-            pass
 
     def run_agentic_loop(
         self,
@@ -590,38 +577,239 @@ class OpenAIConductor:
         completion_sentinel: Optional[str] = ">>>>>> END RESPONSE",
         completion_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        if OpenAI is None:
-            raise RuntimeError("openai package not installed")
+        # Initialize components
+        session_state = SessionState(self.workspace, self.image, self.config)
+        completion_detector = CompletionDetector(
+            config=completion_config or self.config.get("completion", {}),
+            completion_sentinel=completion_sentinel
+        )
+        markdown_logger = MarkdownLogger(output_md_path)
+        # Also seed conversation.md under logging v2 if enabled
+        try:
+            if self.logger_v2.run_dir:
+                self.logger_v2.write_text("conversation/conversation.md", "# Conversation Transcript\n")
+        except Exception:
+            pass
+        telemetry = TelemetryLogger(os.environ.get("RAYCODE_TELEMETRY_PATH"))
+        error_handler = ErrorHandler(output_json_path)
         
-        # Use provider router for client configuration
+        # Clear existing log files
+        for del_path in [output_md_path, output_json_path]:
+            if del_path and os.path.exists(del_path):
+                os.remove(del_path)
+        
+        # Initialize provider and client
         provider_config, resolved_model, supports_native_tools_for_model = provider_router.get_provider_config(model)
+        runtime_descriptor, runtime_model = provider_router.get_runtime_descriptor(model)
         client_config = provider_router.create_client_config(model)
-        
+
+        provider_tools_cfg = dict((self.config.get("provider_tools") or {}))
+        api_variant_override = provider_tools_cfg.get("api_variant")
+        if api_variant_override and runtime_descriptor.provider_id == "openai":
+            variant = str(api_variant_override).lower()
+            if variant == "responses":
+                runtime_descriptor.runtime_id = "openai_responses"
+                runtime_descriptor.default_api_variant = "responses"
+            elif variant == "chat":
+                runtime_descriptor.runtime_id = "openai_chat"
+                runtime_descriptor.default_api_variant = "chat"
+
         if not client_config["api_key"]:
             raise RuntimeError(f"{provider_config.api_key_env} missing in environment")
-        
+
+        runtime = provider_registry.create_runtime(runtime_descriptor)
+
         # Create client with provider-specific configuration
-        client_kwargs = {"api_key": client_config["api_key"]}
-        if client_config.get("base_url"):
-            client_kwargs["base_url"] = client_config["base_url"]
-        if client_config.get("default_headers"):
-            client_kwargs["default_headers"] = client_config["default_headers"]
+        client = runtime.create_client(
+            client_config["api_key"],
+            base_url=client_config.get("base_url"),
+            default_headers=client_config.get("default_headers"),
+        )
+
+        model = runtime_model  # Update model to resolved version for API calls
+        session_state.set_provider_metadata("provider_id", runtime_descriptor.provider_id)
+        session_state.set_provider_metadata("runtime_id", runtime_descriptor.runtime_id)
+        session_state.set_provider_metadata("api_variant", runtime_descriptor.default_api_variant)
+        session_state.set_provider_metadata("resolved_model", runtime_model)
         
-        client = OpenAI(**client_kwargs)
+        # Defer initial message creation until after tool/dialect resolution so we can compile prompts correctly
+        per_turn_prompt = ""
         
-        # Update model to resolved version for API calls
-        model = resolved_model
-        # Public chat history for JSON output (true messages only)
-        # Enhanced with descriptive debugging fields
-        enhanced_system_msg = {"role": "system", "content": system_prompt}
-        enhanced_user_msg = {"role": "user", "content": user_prompt}
-        
-        messages: List[Dict[str, Any]] = [enhanced_system_msg, enhanced_user_msg]
-        # Provider chat history (what we send to the model). May include synthetic user messages with tool outputs.
-        provider_messages: List[Dict[str, Any]] = [m.copy() for m in messages]
-        # Build local tool-calling prompt for fallback/directives
+        # Setup tool definitions and dialects
         tool_defs_yaml = self._tool_defs_from_yaml()
-        tool_defs = tool_defs_yaml or [
+        tool_defs = tool_defs_yaml or self._get_default_tool_definitions()
+        
+        # Create dialect mapping and filter based on model configuration
+        dialect_mapping = self._create_dialect_mapping()
+        active_dialect_names = self.dialect_manager.get_dialects_for_model(
+            model, list(dialect_mapping.keys())
+        )
+        
+        # Initialize caller for all modes (needed for parsing)
+        # Apply v2 selection ordering (by_model/by_tool_kind) if v2 config detected
+        try:
+            from .compilation.v2_loader import is_v2_config
+            if is_v2_config(self.config):
+                active_dialect_names = self._apply_v2_dialect_selection(active_dialect_names, model, tool_defs)
+        except Exception:
+            pass
+
+        filtered_dialects = [dialect_mapping[name] for name in active_dialect_names if name in dialect_mapping]
+        caller = CompositeToolCaller(filtered_dialects)
+
+        # Initialize session state with initial messages (now that we have tools and dialects)
+        try:
+            if int(self.config.get("version", 0)) == 2 and self.config.get("prompts"):
+                mode_name = self._resolve_active_mode()
+                comp = get_compiler()
+                v2 = comp.compile_v2_prompts(self.config, mode_name, tool_defs, active_dialect_names)
+                system_prompt = v2.get("system") or system_prompt
+                per_turn_prompt = v2.get("per_turn") or ""
+                # Persist compiled system prompt via logging v2
+                try:
+                    if system_prompt and self.logger_v2.run_dir:
+                        self.prompt_logger.save_compiled_system(system_prompt)
+                except Exception:
+                    pass
+                # Persist TPSL catalogs if available
+                try:
+                    if self.logger_v2.run_dir and isinstance(v2.get("tpsl"), dict):
+                        tpsl_meta = v2["tpsl"]
+                        # Choose a stable catalog id from template ids (hash part)
+                        def _catalog_id(meta: dict) -> str:
+                            tid = str(meta.get("template_id", "fallback"))
+                            return tid.split("::")[-1].replace("/", "_")
+                        files = []
+                        # System catalog
+                        if isinstance(tpsl_meta.get("system"), dict):
+                            cid = _catalog_id(tpsl_meta["system"]) or "tpsl"
+                            path = f"prompts/catalogs/{cid}/system_full.md"
+                            self.logger_v2.write_text(path, str(tpsl_meta["system"].get("text", "")))
+                            files.append({
+                                "path": path,
+                                "dialect": tpsl_meta["system"].get("dialect"),
+                                "detail": tpsl_meta["system"].get("detail"),
+                                "template_id": tpsl_meta["system"].get("template_id"),
+                            })
+                        # Per-turn catalog
+                        if isinstance(tpsl_meta.get("per_turn"), dict):
+                            cid = _catalog_id(tpsl_meta["per_turn"]) or "tpsl"
+                            path = f"prompts/catalogs/{cid}/per_turn_short.md"
+                            self.logger_v2.write_text(path, str(tpsl_meta["per_turn"].get("text", "")))
+                            files.append({
+                                "path": path,
+                                "dialect": tpsl_meta["per_turn"].get("dialect"),
+                                "detail": tpsl_meta["per_turn"].get("detail"),
+                                "template_id": tpsl_meta["per_turn"].get("template_id"),
+                            })
+                        if files:
+                            # Use first catalog id as manifest name
+                            name = (files[0]["template_id"] or "tpsl").split("::")[-1]
+                            self.prompt_logger.save_catalog(name, files)
+                except Exception:
+                    pass
+        except Exception:
+            per_turn_prompt = per_turn_prompt or ""
+
+        enhanced_system_msg = {"role": "system", "content": system_prompt}
+        initial_user_content = user_prompt if not per_turn_prompt else (user_prompt + "\n\n" + per_turn_prompt)
+        enhanced_user_msg = {"role": "user", "content": initial_user_content}
+        session_state.add_message(enhanced_system_msg)
+        session_state.add_message(enhanced_user_msg)
+        
+        # Configure native tools and tool prompt mode
+        native_pref_hint = getattr(self, "_native_preference_hint", None)
+        provider_tools_cfg = dict(provider_tools_cfg)
+        if provider_tools_cfg.get("use_native") is None and native_pref_hint is not None:
+            provider_tools_cfg["use_native"] = native_pref_hint
+        effective_config = dict(self.config)
+        effective_config["provider_tools"] = provider_tools_cfg
+        self._provider_tools_effective = provider_tools_cfg
+        use_native_tools = provider_router.should_use_native_tools(model, effective_config)
+        will_use_native_tools = self._setup_native_tools(model, use_native_tools)
+        tool_prompt_mode = self._adjust_tool_prompt_mode(tool_prompt_mode, will_use_native_tools)
+        session_state.last_tool_prompt_mode = tool_prompt_mode
+        
+        # Setup tool prompts and system messages
+        local_tools_prompt = self._setup_tool_prompts(
+            tool_prompt_mode, tool_defs, active_dialect_names, 
+            session_state, markdown_logger, caller
+        )
+        
+        # Add enhanced descriptive fields to initial messages after tool setup
+        self._add_enhanced_message_fields(
+            tool_prompt_mode, tool_defs, active_dialect_names, 
+            session_state, will_use_native_tools, local_tools_prompt, user_prompt
+        )
+        
+        # Initialize markdown log and snapshot
+        markdown_logger.log_system_message(system_prompt)
+        try:
+            if self.logger_v2.run_dir:
+                self.logger_v2.append_text("conversation/conversation.md", self.md_writer.system(system_prompt))
+        except Exception:
+            pass
+        # Use enhanced user content for markdown log
+        initial_user_content = session_state.messages[1].get("content", user_prompt)
+        markdown_logger.log_user_message(initial_user_content)
+        try:
+            if self.logger_v2.run_dir:
+                self.logger_v2.append_text("conversation/conversation.md", self.md_writer.user(initial_user_content))
+        except Exception:
+            pass
+        session_state.write_snapshot(output_json_path, model)
+        
+        # Main agentic loop - significantly simplified
+        try:
+            return self._run_main_loop(
+                runtime,
+                client,
+                model,
+                max_steps,
+                output_json_path,
+                tool_prompt_mode,
+                tool_defs,
+                active_dialect_names,
+                caller,
+                session_state,
+                completion_detector,
+                markdown_logger,
+                error_handler,
+                stream_responses,
+                local_tools_prompt,
+            )
+        finally:
+            self._persist_final_workspace()
+    
+    def _persist_final_workspace(self) -> None:
+        """Copy the final workspace into the run's log directory if available."""
+        run_dir = getattr(self.logger_v2, "run_dir", None)
+        if not run_dir:
+            return
+        try:
+            workspace_path = Path(self.workspace)
+        except Exception:
+            return
+        if not workspace_path.exists() or not workspace_path.is_dir():
+            return
+        dest = Path(run_dir) / "final_container_dir"
+        try:
+            workspace_resolved = workspace_path.resolve()
+            dest_resolved = dest.resolve(strict=False)
+            if str(dest_resolved).startswith(str(workspace_resolved)):
+                return
+        except Exception:
+            pass
+        try:
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(workspace_path, dest)
+        except Exception:
+            pass
+
+    def _get_default_tool_definitions(self) -> List[ToolDefinition]:
+        """Get default tool definitions"""
+        return [
             ToolDefinition(
                 type_id="python",
                 name="run_shell",
@@ -699,31 +887,198 @@ class OpenAIConductor:
                 ],
             ),
         ]
-        # Create mapping from config names to dialect instances
-        dialect_mapping = {
+    
+    def _create_dialect_mapping(self) -> Dict[str, Any]:
+        """Create mapping from config names to dialect instances"""
+        return {
             "pythonic02": Pythonic02Dialect(),
             "pythonic_inline": PythonicInlineDialect(), 
             "bash_block": BashBlockDialect(),
             "aider_diff": AiderDiffDialect(),
             "unified_diff": UnifiedDiffDialect(),
             "opencode_patch": OpenCodePatchDialect(),
+            "yaml_command": YAMLCommandDialect(),
         }
-        all_dialects = list(dialect_mapping.values())
-        
-        # Filter dialects based on model configuration using config names
-        config_dialect_names = list(dialect_mapping.keys())
-        active_dialect_names = self.dialect_manager.get_dialects_for_model(
-            model, 
-            config_dialect_names
-        )
-        
-        # Initialize caller for all modes (needed for parsing)
-        filtered_dialects = [dialect_mapping[name] for name in active_dialect_names if name in dialect_mapping]
-        caller = CompositeToolCaller(filtered_dialects)
-        
-        # CRITICAL: Detect native tools early and adjust tool_prompt_mode before adding prompts
-        # Use provider router to determine native tool capability
-        use_native_tools = provider_router.should_use_native_tools(model, self.config)
+
+    def _apply_v2_dialect_selection(self, current: List[str], model_id: str, tool_defs: List[ToolDefinition]) -> List[str]:
+        """Apply v2 dialect selection rules (preference + legacy selection).
+
+        - Reorders the input list according to config.tools.dialects.selection
+        - Honors config.tools.dialects.preference for native vs text fallbacks
+        - Preserves only dialects present in the current list
+        """
+        try:
+            tools_cfg = (self.config.get("tools", {}) or {})
+            dialects_cfg = (tools_cfg.get("dialects", {}) or {})
+            selection_cfg = (dialects_cfg.get("selection", {}) or {})
+            base_order = self._apply_selection_legacy(current, model_id, tool_defs, selection_cfg)
+
+            preference_cfg = (dialects_cfg.get("preference", {}) or {})
+            if preference_cfg:
+                ordered, native_hint = self._apply_preference_order(base_order, model_id, tool_defs, preference_cfg)
+                self._native_preference_hint = native_hint
+                return ordered
+
+            self._native_preference_hint = None
+            return base_order
+        except Exception:
+            self._native_preference_hint = None
+            return current
+
+    def _apply_selection_legacy(
+        self,
+        current: List[str],
+        model_id: str,
+        tool_defs: List[ToolDefinition],
+        selection_cfg: Dict[str, Any],
+    ) -> List[str]:
+        """Legacy selection logic retained for backward compatibility."""
+        by_model: Dict[str, List[str]] = selection_cfg.get("by_model", {}) or {}
+        by_tool_kind: Dict[str, List[str]] = selection_cfg.get("by_tool_kind", {}) or {}
+
+        def ordered_intersection(prefer: List[str], available: List[str]) -> List[str]:
+            seen = set()
+            out: List[str] = []
+            for name in prefer:
+                if name in available and name not in seen:
+                    out.append(name)
+                    seen.add(name)
+            return out
+
+        import fnmatch as _fnmatch
+
+        preferred: List[str] = []
+        if model_id:
+            for pattern, prefer_list in by_model.items():
+                try:
+                    if _fnmatch.fnmatch(model_id, pattern):
+                        preferred.extend(ordered_intersection([str(x) for x in (prefer_list or [])], current))
+                except Exception:
+                    continue
+
+        present_types = {t.type_id for t in (tool_defs or []) if getattr(t, "type_id", None)}
+        diff_pref_list = [str(x) for x in (by_tool_kind.get("diff", []) or [])]
+        bash_pref_list = [str(x) for x in (by_tool_kind.get("bash", []) or [])]
+
+        known_diff_names = set(diff_pref_list) | {"aider_diff", "unified_diff", "opencode_patch"}
+        diff_present = ("diff" in present_types) or any(name in current for name in known_diff_names)
+        bash_present = any(name in current for name in (bash_pref_list or ["bash_block"]))
+
+        if diff_present and diff_pref_list:
+            preferred.extend(ordered_intersection(diff_pref_list, current))
+        if bash_present and bash_pref_list:
+            preferred.extend(ordered_intersection(bash_pref_list, current))
+
+        seen = set()
+        ordered_pref = [d for d in preferred if (d not in seen and not seen.add(d))]
+        remaining = [d for d in current if d not in ordered_pref]
+        return ordered_pref + remaining
+
+    def _apply_preference_order(
+        self,
+        base_order: List[str],
+        model_id: str,
+        tool_defs: List[ToolDefinition],
+        preference_cfg: Dict[str, Any],
+    ) -> Tuple[List[str], Optional[bool]]:
+        """Apply declarative preference ordering and return (order, native_hint)."""
+        import fnmatch as _fnmatch
+
+        available = list(base_order)
+        available_set = set(available)
+        preferred: List[str] = []
+        seen = set()
+        native_hint: Optional[bool] = None
+
+        def normalize_entry(entry: Any) -> Tuple[List[str], Optional[bool]]:
+            native_override: Optional[bool] = None
+            order_values: List[Any]
+
+            if isinstance(entry, dict):
+                order_values = entry.get("order")  # type: ignore[assignment]
+                if order_values is None and "list" in entry:
+                    order_values = entry.get("list")
+                native_val = entry.get("native")
+                if native_val is not None:
+                    native_override = bool(native_val)
+            else:
+                order_values = entry
+
+            if isinstance(order_values, str):
+                raw_items = [order_values]
+            elif isinstance(order_values, (list, tuple)):
+                raw_items = list(order_values)
+            elif order_values is None:
+                raw_items = []
+            else:
+                raw_items = [str(order_values)]
+
+            cleaned: List[str] = []
+            for item in raw_items:
+                item_str = str(item).strip()
+                if not item_str:
+                    continue
+                if item_str == "provider_native":
+                    if native_override is None:
+                        native_override = True
+                    continue
+                cleaned.append(item_str)
+
+            return cleaned, native_override
+
+        def extend(entry: Any) -> None:
+            nonlocal native_hint
+            order_list, native_override = normalize_entry(entry)
+            for name in order_list:
+                if name not in available_set:
+                    continue
+                if name in seen:
+                    try:
+                        preferred.remove(name)
+                    except ValueError:
+                        pass
+                else:
+                    seen.add(name)
+                preferred.append(name)
+            if native_override is not None and native_hint is None:
+                native_hint = native_override
+
+        if model_id:
+            for pattern, entry in (preference_cfg.get("by_model", {}) or {}).items():
+                try:
+                    if _fnmatch.fnmatch(model_id, pattern):
+                        extend(entry)
+                except Exception:
+                    continue
+
+        present_types = {t.type_id for t in (tool_defs or []) if getattr(t, "type_id", None)}
+        available_names = set(available)
+
+        for kind, entry in (preference_cfg.get("by_tool_kind", {}) or {}).items():
+            if kind == "diff":
+                diff_names = normalize_entry(entry)[0]
+                diff_present = ("diff" in present_types) or any(name in available_names for name in diff_names)
+                if not diff_present:
+                    continue
+            elif kind == "bash":
+                bash_names = normalize_entry(entry)[0]
+                bash_present = any(name in available_names for name in (bash_names or ["bash_block"]))
+                if not bash_present:
+                    continue
+            extend(entry)
+
+        extend(preference_cfg.get("default"))
+
+        remaining = [d for d in available if d not in seen]
+        ordered = preferred + remaining
+        return ordered, native_hint
+
+    def _get_native_preference_hint(self) -> Optional[bool]:
+        """Testing helper: expose resolved native preference hint."""
+        return getattr(self, "_native_preference_hint", None)
+
+    def _setup_native_tools(self, model: str, use_native_tools: bool) -> bool:
+        """Setup native tools configuration"""
         will_use_native_tools = False
         
         if use_native_tools and getattr(self, "yaml_tools", None):
@@ -737,76 +1092,51 @@ class OpenAIConductor:
             except Exception:
                 will_use_native_tools = False
         
-        # Override tool_prompt_mode if native tools will be used
+        return will_use_native_tools
+    
+    def _adjust_tool_prompt_mode(self, tool_prompt_mode: str, will_use_native_tools: bool) -> str:
+        """Adjust tool prompt mode based on native tools usage"""
         if will_use_native_tools:
-            suppress_prompts = bool(self.config.get("provider_tools", {}).get("suppress_prompts", False))
+            provider_cfg = getattr(self, "_provider_tools_effective", None) or (self.config.get("provider_tools") or {})
+            suppress_prompts = bool(provider_cfg.get("suppress_prompts", False))
             if suppress_prompts:
-                tool_prompt_mode = "none"  # Suppress prompts entirely for native tools
+                return "none"  # Suppress prompts entirely for native tools
             else:
-                tool_prompt_mode = "per_turn_append"  # Minimal prompts for native tools
-        
-        # Store tool_prompt_mode for debugging
-        self.last_tool_prompt_mode = tool_prompt_mode
-        
-        # Initialize SoTA completion detection system
-        default_completion_config = {
-            "primary_method": "hybrid",  # tool_based | text_based | provider_based | hybrid
-            "enable_text_sentinels": True,
-            "enable_provider_signals": True,
-            "enable_natural_finish": True,
-            "confidence_threshold": 0.6,
-            "text_sentinels": [
-                completion_sentinel,
-                "TASK COMPLETE",
-                "ALL TESTS PASSED", 
-                "IMPLEMENTATION COMPLETE",
-                "DONE"
-            ] if completion_sentinel else [
-                "TASK COMPLETE",
-                "ALL TESTS PASSED",
-                "IMPLEMENTATION COMPLETE", 
-                "DONE"
-            ],
-            "success_keywords": [
-                "success", "complete", "finished", "done", "passed", "working", "ready"
-            ],
-            "failure_keywords": [
-                "failed", "error", "broken", "timeout", "cancelled"
-            ]
-        }
-        
-        # Merge with config from YAML file 
-        yaml_completion_config = self.config.get("completion", {}) if hasattr(self, 'config') and self.config else {}
-        if yaml_completion_config.get("text_sentinels"):
-            # Merge text sentinels from YAML with defaults
-            yaml_sentinels = yaml_completion_config["text_sentinels"]
-            default_sentinels = default_completion_config["text_sentinels"]
-            yaml_completion_config["text_sentinels"] = list(set(yaml_sentinels + default_sentinels))
-        
-        self.completion_config = {**default_completion_config, **yaml_completion_config, **(completion_config or {})}
-        
+                return "per_turn_append"  # Minimal prompts for native tools
+        return tool_prompt_mode
+    
+    def _setup_tool_prompts(
+        self, 
+        tool_prompt_mode: str, 
+        tool_defs: List[ToolDefinition], 
+        active_dialect_names: List[str],
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+        caller
+    ) -> str:
+        """Setup tool prompts based on mode and return local_tools_prompt"""
         # Use only text-based tools for prompt compilation (exclude provider-native tools)
         prompt_tool_defs = getattr(self, 'current_text_based_tools', None) or tool_defs
+        # Apply v2 mode gating and loop turn strategy
+        if int(self.config.get("version", 0)) == 2:
+            active_mode = self._resolve_active_mode()
+            mode_cfg = self._get_mode_config(active_mode)
+            if mode_cfg:
+                prompt_tool_defs = self._filter_tools_by_mode(prompt_tool_defs, mode_cfg)
+            self._apply_turn_strategy_from_loop()
         
-        # Handle different tool prompt modes
         if tool_prompt_mode == "system_compiled_and_persistent_per_turn":
             # NEW MODE: Use comprehensive cached system prompt + small per-turn availability
             compiler = get_compiler()
             
             # Get comprehensive system prompt (cached) - includes primary prompt first
-            primary_prompt = messages[0].get("content", "")
+            primary_prompt = session_state.messages[0].get("content", "")
             comprehensive_prompt, tools_hash = compiler.get_or_create_system_prompt(prompt_tool_defs, active_dialect_names, primary_prompt)
             
             # Replace system prompt with comprehensive version (primary + tools)
-            messages[0]["content"] = comprehensive_prompt
+            session_state.messages[0]["content"] = comprehensive_prompt
+            session_state.provider_messages[0]["content"] = comprehensive_prompt
             
-            # Create enhanced per-turn availability formatter with format preferences
-            def get_per_turn_availability():
-                enabled_tools = [t.name for t in prompt_tool_defs]
-                preferred_formats = compiler.get_preferred_formats(active_dialect_names)
-                return compiler.format_per_turn_availability_enhanced(enabled_tools, preferred_formats)
-            
-            tool_directive_text = get_per_turn_availability()
             local_tools_prompt = "(using cached comprehensive system prompt with research-based preferences)"
         else:
             # LEGACY MODES: Use old composite caller approach
@@ -831,32 +1161,30 @@ class OpenAIConductor:
                 "NEVER use bash to write large file contents (heredocs, echo >>). For files: call create_file() then apply a diff block for contents.\n"
                 "Do NOT include extra prose.\nEND SYSTEM MESSAGE\n"
             )
-        for del_path in [output_md_path, output_json_path]:
-            if os.path.exists(del_path):
-                os.remove(del_path)
+            
+            # Optionally embed the tools directive once into the initial system prompt
+            if tool_prompt_mode in ("system_once", "system_and_per_turn"):
+                session_state.messages[0]["content"] = (session_state.messages[0].get("content") or "") + tool_directive_text
+                session_state.provider_messages[0]["content"] = session_state.messages[0]["content"]
+                # Mirror into markdown log
+                markdown_logger.log_tool_availability([t.name for t in tool_defs])
         
-        # Helper: concise tools list for markdown-only logging
-        def _tools_available_md(tools: List[ToolDefinition]) -> str:
-            names = "\n".join(t.name for t in tools)
-            return f"<TOOLS_AVAILABLE>\n{names}\n</TOOLS_AVAILABLE>"
-
-        # Optionally embed the tools directive once into the initial system prompt
-        if tool_prompt_mode in ("system_once", "system_and_per_turn"):
-            messages[0]["content"] = (messages[0].get("content") or "") + tool_directive_text
-            # Mirror into markdown log
-            self._append_markdown(output_md_path, [{"role": "System", "content": _tools_available_md(tool_defs)}])
-        elif tool_prompt_mode == "system_compiled_and_persistent_per_turn":
-            # The comprehensive prompt was already added to system message above
-            # Don't log the abridged availability as a system message - it will be added to user messages
-            pass
-        elif tool_prompt_mode == "none":
-            # Native tools mode: suppress all tool prompts - tools are provided via OpenAI API
-            pass
-
-        # Add enhanced descriptive fields to initial messages after tool setup
+        return local_tools_prompt
+    
+    def _add_enhanced_message_fields(
+        self,
+        tool_prompt_mode: str,
+        tool_defs: List[ToolDefinition],
+        active_dialect_names: List[str],
+        session_state: SessionState,
+        will_use_native_tools: bool,
+        local_tools_prompt: str,
+        user_prompt: str
+    ):
+        """Add enhanced descriptive fields to initial messages"""
         # System message enhancement
         if tool_prompt_mode in ("system_once", "system_and_per_turn", "system_compiled_and_persistent_per_turn"):
-            messages[0]["compiled_tools_available"] = [
+            session_state.messages[0]["compiled_tools_available"] = [
                 {
                     "name": t.name,
                     "type_id": t.type_id,
@@ -874,720 +1202,962 @@ class OpenAIConductor:
             enabled_tools = [t.name for t in tool_defs]
             tools_prompt_content = get_compiler().format_per_turn_availability(enabled_tools, active_dialect_names)
         elif tool_prompt_mode in ("per_turn_append", "system_and_per_turn"):
-            tools_prompt_content = tool_directive_text
+            tools_prompt_content = local_tools_prompt
         
         # Check if native tools will be used
         if will_use_native_tools:
             try:
                 native_tools = getattr(self, 'current_native_tools', [])
                 if native_tools:
-                    provider_id = provider_router.parse_model_id(model)[0]
+                    provider_id = provider_router.parse_model_id(self.config.get("model", "gpt-4"))[0]
                     native_tools_spec = provider_adapter_manager.translate_tools_to_native_schema(native_tools, provider_id)
             except Exception:
                 pass
         
-        messages[1]["tools_available_prompt"] = tools_prompt_content
+        session_state.messages[1]["tools_available_prompt"] = tools_prompt_content
         if native_tools_spec:
-            messages[1]["tools"] = native_tools_spec
-        
-        transcript: List[Dict[str, Any]] = []
+            session_state.messages[1]["tools"] = native_tools_spec
         
         # For the new mode, append tools to initial user message too
-        initial_user_content = user_prompt
         if tool_prompt_mode == "system_compiled_and_persistent_per_turn":
             enabled_tools = [t.name for t in tool_defs]
             per_turn_availability = get_compiler().format_per_turn_availability(enabled_tools, active_dialect_names)
             initial_user_content = user_prompt + "\n\n" + per_turn_availability
             # Also update the actual message arrays
-            messages[1]["content"] = initial_user_content
-            provider_messages[1]["content"] = initial_user_content
+            session_state.messages[1]["content"] = initial_user_content
+            session_state.provider_messages[1]["content"] = initial_user_content
+    
+    def _run_main_loop(
+        self,
+        runtime,
+        client,
+        model: str,
+        max_steps: int,
+        output_json_path: str,
+        tool_prompt_mode: str,
+        tool_defs: List[ToolDefinition],
+        active_dialect_names: List[str],
+        caller,
+        session_state: SessionState,
+        completion_detector: CompletionDetector,
+        markdown_logger: MarkdownLogger,
+        error_handler: ErrorHandler,
+        stream_responses: bool,
+        local_tools_prompt: str
+    ) -> Dict[str, Any]:
+        """Main agentic loop - significantly simplified and readable"""
         
-        # Initialize markdown log with initial messages
-        self._append_markdown(output_md_path, [
-            {"role": "System", "content": system_prompt},
-            {"role": "User", "content": initial_user_content},
-        ])
-        # Initial snapshot
-        self._write_snapshot(output_json_path, model, messages, transcript)
-        for _ in range(max_steps):
+        completed = False
+        step_index = -1
+
+        for step_index in range(max_steps):
             try:
-                # Build a per-turn message list that appends tool prompts into the last user message
-                send_messages: List[Dict[str, Any]] = [dict(m) for m in provider_messages]
-                # Ensure last message is user; if not, append a user wrapper for tools prompt
-                if not send_messages or send_messages[-1].get("role") != "user":
-                    send_messages.append({"role": "user", "content": ""})
-                if tool_prompt_mode in ("per_turn_append", "system_and_per_turn"):
-                    send_messages[-1]["content"] = (send_messages[-1].get("content") or "") + tool_directive_text
-                    # Log the tool prompt to markdown for debugging
-                    self._append_markdown(output_md_path, [{"role": "System", "content": _tools_available_md(tool_defs)}])
-                elif tool_prompt_mode == "system_compiled_and_persistent_per_turn":
-                    # NEW MODE: Permanently append small availability list to user messages
-                    # Get fresh per-turn availability (in case tools changed)
-                    enabled_tools = [t.name for t in tool_defs]
-                    per_turn_availability = get_compiler().format_per_turn_availability(enabled_tools, active_dialect_names)
-                    
-                    # Permanently append to the actual message history
-                    send_messages[-1]["content"] = (send_messages[-1].get("content") or "") + "\n\n" + per_turn_availability
-                    provider_messages[-1]["content"] = (provider_messages[-1].get("content") or "") + "\n\n" + per_turn_availability
-                elif tool_prompt_mode == "none":
-                    # Native tools mode: no tool prompts added - tools provided via OpenAI API
-                    pass
-                # Per-turn tooling context logging (available tools + compiled tools prompt)
-                transcript.append(
-                    {
-                        "tools_context": {
-                            "available_tools": _dump_tool_defs(tool_defs),
-                            "compiled_tools_prompt": local_tools_prompt,
-                        }
-                    }
+                # Build request and get response
+                provider_result = self._get_model_response(
+                    runtime,
+                    client,
+                    model,
+                    tool_prompt_mode,
+                    tool_defs,
+                    active_dialect_names,
+                    session_state,
+                    markdown_logger,
+                    stream_responses,
+                    local_tools_prompt,
                 )
-                # Snapshot after adding tooling context to enable near real-time monitoring
-                self._write_snapshot(output_json_path, model, messages, transcript)
-                # Always use raw text prompting; do not pass native tools to avoid provider call_id coupling
-                # Optionally pass provider-native tools based on provider capabilities
-                use_native_tools = provider_router.should_use_native_tools(model, self.config)
-                tools_schema = None
-                if use_native_tools and getattr(self, "current_native_tools", None):
-                    try:
-                        # Use provider adapter to translate tools to native schema
-                        provider_id = provider_router.parse_model_id(model)[0]
-                        native_tools = getattr(self, 'current_native_tools', [])
-                        if native_tools:
-                            tools_schema = provider_adapter_manager.translate_tools_to_native_schema(native_tools, provider_id)
-                    except Exception:
-                        tools_schema = None
+                if session_state.get_provider_metadata("streaming_disabled"):
+                    stream_responses = False
+                if provider_result.usage:
+                    session_state.set_provider_metadata("usage", provider_result.usage)
 
-                create_kwargs = {
-                    "model": model,
-                    "messages": send_messages,
-                }
-                if tools_schema:
-                    create_kwargs["tools"] = tools_schema
-                    # Note: tool_prompt_mode was already adjusted earlier based on provider_tools config
+                if provider_result.encrypted_reasoning:
+                    for payload in provider_result.encrypted_reasoning:
+                        session_state.reasoning_traces.record_encrypted_trace(payload)
 
-                resp = client.chat.completions.create(**create_kwargs)
+                if provider_result.reasoning_summaries:
+                    for summary_text in provider_result.reasoning_summaries:
+                        session_state.reasoning_traces.record_summary(summary_text)
+
+                if provider_result.metadata:
+                    for meta_key, meta_value in provider_result.metadata.items():
+                        session_state.set_provider_metadata(meta_key, meta_value)
+
+                if not provider_result.messages:
+                    session_state.add_transcript_entry({"provider_response": "empty"})
+                    empty_choice = SimpleNamespace(finish_reason=None, index=None)
+                    session_state.add_transcript_entry(
+                        error_handler.handle_empty_response(empty_choice)
+                    )
+                    if not getattr(session_state, "completion_summary", None):
+                        session_state.completion_summary = {
+                            "completed": False,
+                            "reason": "empty_response",
+                            "method": "provider_empty",
+                        }
+                    if stream_responses:
+                        print("[stop] reason=empty-response")
+                    break
+
+                for provider_message in provider_result.messages:
+                    # Log model response
+                    self._log_provider_message(
+                        provider_message, session_state, markdown_logger, stream_responses
+                    )
+
+                    # Handle empty responses per message
+                    if not provider_message.tool_calls and not (provider_message.content or ""):
+                        empty_choice = SimpleNamespace(
+                            finish_reason=provider_message.finish_reason,
+                            index=provider_message.index,
+                        )
+                        session_state.add_transcript_entry(
+                            error_handler.handle_empty_response(empty_choice)
+                        )
+                        if not getattr(session_state, "completion_summary", None):
+                            session_state.completion_summary = {
+                                "completed": False,
+                                "reason": "empty_response",
+                                "method": "provider_empty",
+                            }
+                        if stream_responses:
+                            print("[stop] reason=empty-response")
+                        completed = False
+                        break
+
+                    # Process tool calls or content
+                    completion_detected = self._process_model_output(
+                        provider_message,
+                        caller,
+                        tool_defs,
+                        session_state,
+                        completion_detector,
+                        markdown_logger,
+                        error_handler,
+                        stream_responses,
+                        model,
+                    )
+
+                    if completion_detected:
+                        completed = True
+                        if not getattr(session_state, "completion_summary", None):
+                            session_state.completion_summary = {
+                                "completed": True,
+                                "reason": "completion_detected",
+                                "method": "completion_detector",
+                            }
+                        else:
+                            session_state.completion_summary.setdefault("completed", True)
+                        break
+                if completed:
+                    break
+
             except Exception as e:
-                # Surface OpenAI errors without crashing the actor
-                result = {
-                    "error": str(e),
-                    "error_type": e.__class__.__name__,
-                    "messages": messages,
-                    "transcript": transcript,
-                    "hint": "Verify OPENAI_API_KEY and model name; try a known model via --model",
-                }
-                # Write error snapshot
+                # Handle provider errors and surface immediately to logs/stdout
+                result = error_handler.handle_provider_error(
+                    e, session_state.messages, session_state.transcript
+                )
+                warning_text = (
+                    f"[provider-error] {result.get('error_type', type(e).__name__)}: "
+                    f"{result.get('error', str(e))}"
+                )
                 try:
-                    if output_json_path:
-                        Path(output_json_path).write_text(json.dumps(result, indent=2))
+                    markdown_logger.log_system_message(warning_text)
+                except Exception:
+                    pass
+                try:
+                    session_state.add_transcript_entry({
+                        "provider_error": {
+                            "type": result.get("error_type"),
+                            "message": result.get("error"),
+                            "hint": result.get("hint"),
+                        }
+                    })
+                except Exception:
+                    pass
+                try:
+                    if getattr(self.logger_v2, "run_dir", None):
+                        turn_idx = len(session_state.transcript) + 1
+                        self.logger_v2.write_json(
+                            f"errors/turn_{turn_idx}.json",
+                            result,
+                        )
+                except Exception:
+                    pass
+                try:
+                    print(warning_text)
+                    if result.get("hint"):
+                        print(f"Hint: {result['hint']}")
+                    if result.get("traceback"):
+                        print(result["traceback"])
+                    details = result.get("details")
+                    snippet = None
+                    if isinstance(details, dict):
+                        snippet = details.get("body_snippet")
+                    if snippet:
+                        print(f"Provider response snippet: {snippet}")
                 except Exception:
                     pass
                 return result
-            choice = resp.choices[0]
-            msg = choice.message
-            # Lightweight debug snapshot of the model's first choice
+
+    def _invoke_runtime_with_streaming(
+        self,
+        runtime,
+        client,
+        model: str,
+        send_messages: List[Dict[str, Any]],
+        tools_schema: Optional[List[Dict[str, Any]]],
+        stream_responses: bool,
+        runtime_context: ProviderRuntimeContext,
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+    ) -> Tuple[ProviderResult, bool]:
+        """Invoke provider runtime, falling back to non-streaming on failure."""
+
+        fallback_stream_reason: Optional[str] = None
+        result: Optional[ProviderResult] = None
+        if stream_responses:
             try:
-                debug_tc = None
-                if getattr(msg, "tool_calls", None):
-                    debug_tc = [
-                        {"id": getattr(tc, "id", None), "name": getattr(getattr(tc, "function", None), "name", None)}
-                        for tc in msg.tool_calls
-                    ]
-                transcript.append(
-                    {
-                        "choice_debug": {
-                            "finish_reason": getattr(choice, "finish_reason", None),
-                            "has_content": bool(getattr(msg, "content", None)),
-                            "tool_calls_len": len(msg.tool_calls) if getattr(msg, "tool_calls", None) else 0,
-                        }
-                    }
+                result = runtime.invoke(
+                    client=client,
+                    model=model,
+                    messages=send_messages,
+                    tools=tools_schema,
+                    stream=True,
+                    context=runtime_context,
                 )
-            except Exception:
-                pass
-            # Mirror assistant response into markdown log
-            if getattr(msg, "content", None):
-                self._append_markdown(output_md_path, [{"role": "Assistant", "content": str(msg.content)}])
-            # Optional stdout echo (non-blocking)
-            if stream_responses and getattr(msg, "content", None):
+            except ProviderRuntimeError as exc:
+                fallback_stream_reason = str(exc) or exc.__class__.__name__
+
+        used_streaming = stream_responses and result is not None
+
+        if result is None:
+            if fallback_stream_reason and stream_responses:
+                warning_payload = {
+                    "provider": runtime.descriptor.provider_id,
+                    "runtime": runtime.descriptor.runtime_id,
+                    "reason": fallback_stream_reason,
+                }
+                session_state.add_transcript_entry({"streaming_disabled": warning_payload})
+                warning_text = (
+                    "[streaming-disabled] "
+                    f"Provider {runtime.descriptor.provider_id} ({runtime.descriptor.runtime_id}) "
+                    f"rejected streaming: {fallback_stream_reason}. Falling back to non-streaming."
+                )
                 try:
-                    print(str(msg.content))
+                    markdown_logger.log_system_message(warning_text)
                 except Exception:
                     pass
-
-            # Capture degenerate responses to aid debugging
-            if not getattr(msg, "tool_calls", None) and not getattr(msg, "content", None):
-                transcript.append(
-                    {
-                        "empty_response": {
-                            "finish_reason": getattr(choice, "finish_reason", None),
-                            "index": getattr(choice, "index", None),
-                        }
-                    }
-                )
-                # Break to avoid looping endlessly on empty responses
-                if stream_responses:
-                    print("[stop] reason=empty-response")
-                break
-            # Fallback parse for local tool-calling if no function-tools present but text includes our dialects
-            if not getattr(msg, "tool_calls", None) and (msg.content or ""):
-                parsed = caller.parse_all(msg.content, tool_defs)
-                if parsed:
-                    # CRITICAL: Add assistant message with text-based tool calls to messages array
-                    # Create synthetic tool_calls array with enhanced metadata for text-based parsing
-                    synthetic_tool_calls = []
-                    for i, p in enumerate(parsed):
-                        synthetic_tool_calls.append({
-                            "id": f"text_call_{i}",
-                            "type": "function", 
-                            "function": {
-                                "name": p.function,
-                                "arguments": json.dumps(p.arguments) if isinstance(p.arguments, dict) else str(p.arguments)
-                            },
-                            "syntax_type": "custom-pythonic"  # Our <TOOL_CALL> format
-                        })
-                    
-                    assistant_entry = {
-                        "role": "assistant", 
-                        "content": msg.content,
-                        "tool_calls": synthetic_tool_calls
-                    }
-                    messages.append(assistant_entry)
-                    transcript.append({
-                        "assistant_with_text_tool_calls": {
-                            "content": msg.content,
-                            "parsed_tools_count": len(parsed),
-                            "parsed_tools": [p.function for p in parsed]
-                        }
-                    })
-                    
-                    # NEW: Validate tool calls against design decision constraints
-                    tool_calls_for_validation = [{"name": p.function, "args": p.arguments} for p in parsed]
-                    
-                    # Use enhanced validation if available
-                    validation_result = None
-                    if self.config_validator:
-                        validation_result = self.config_validator.validate_tool_calls(tool_calls_for_validation)
-                        
-                        # Check for validation errors (critical constraints)
-                        if not validation_result["valid"]:
-                            error_message = "Tool execution validation failed:\n" + "\n".join(validation_result["errors"])
-                            formatted_error = f"<VALIDATION_ERROR>\n{error_message}\n</VALIDATION_ERROR>"
-                            
-                            provider_messages.append({"role": "user", "content": formatted_error})
-                            self._append_markdown(output_md_path, [{"role": "User", "content": formatted_error}])
-                            
-                            if stream_responses:
-                                print(f"[stop] reason=validation-failed")
-                            continue
-                    
-                    # Execute tool calls in order with policy controls
-                    # IMPORTANT: Prioritize file operations before bash commands to avoid bash failures cancelling file creation
-                    file_ops = [p for p in parsed if p.function in ['create_file', 'create_file_from_block', 'apply_unified_patch', 'apply_search_replace']]
-                    other_ops = [p for p in parsed if p.function not in ['create_file', 'create_file_from_block', 'apply_unified_patch', 'apply_search_replace']]
-                    reordered_parsed = file_ops + other_ops
-                    
-                    # CRITICAL: Check for mark_task_complete isolation constraint
-                    completion_calls = [p for p in parsed if p.function == "mark_task_complete"]
-                    if completion_calls and len(parsed) > 1:
-                        # Mark_task_complete must be isolated - reject other operations
-                        error_msg = f"mark_task_complete() cannot be combined with other operations. Found {len(parsed)} total calls including: {[p.function for p in parsed]}"
-                        formatted_error = f"<CONSTRAINT_ERROR>\n{error_msg}\nPlease call mark_task_complete() alone in a separate response after completing all file operations.\n</CONSTRAINT_ERROR>"
-                        
-                        provider_messages.append({"role": "user", "content": formatted_error})
-                        self._append_markdown(output_md_path, [{"role": "User", "content": formatted_error}])
-                        
-                        if stream_responses:
-                            print(f"[constraint] mark_task_complete isolation violated")
-                        continue
-                    
-                    # Helper to run a single call
-                    def _exec_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-                        tool_call = {"function": name, "arguments": args}
-                        
-                        # Use enhanced executor if available
-                        if self.enhanced_executor:
-                            try:
-                                import asyncio
-                                
-                                # Create async wrapper for _exec_raw
-                                async def async_exec_raw(tool_call):
-                                    return self._exec_raw(tool_call)
-                                
-                                # Try to get existing event loop, create new one if needed
-                                try:
-                                    loop = asyncio.get_event_loop()
-                                    if loop.is_closed():
-                                        raise RuntimeError("Loop is closed")
-                                except RuntimeError:
-                                    loop = asyncio.new_event_loop()
-                                    asyncio.set_event_loop(loop)
-                                
-                                result = loop.run_until_complete(
-                                    self.enhanced_executor.execute_tool_call(tool_call, async_exec_raw)
-                                )
-                                return result
-                            except Exception:
-                                # Fallback to raw execution on enhanced executor failure
-                                pass
-                        
-                        # Raw execution (original implementation)
-                        return self._exec_raw(tool_call)
-                    
-                    # Concurrency policy: allow multiple nonblocking tools per turn (diff/read/search), but do not mix with others in same turn
-                    turn_cfg = self.config.get("turn_strategy", {}) if isinstance(self.config, dict) else {}
-                    allow_multi = bool(turn_cfg.get("allow_multiple_per_turn", False))
-                    conc_cfg = self.config.get("concurrency", {}) if isinstance(self.config, dict) else {}
-                    nonblocking_names = set(conc_cfg.get("nonblocking_tools", [])) or set([
-                        'apply_unified_patch', 'apply_search_replace', 'create_file_from_block',
-                        'read', 'read_file', 'glob', 'grep', 'list', 'list_dir', 'patch'
-                    ])
-                    nb_calls = [p for p in reordered_parsed if p.function in nonblocking_names]
-                    other_calls = [p for p in reordered_parsed if p.function not in nonblocking_names]
-                    if nb_calls:
-                        calls_to_execute = nb_calls
-                    else:
-                        calls_to_execute = reordered_parsed if allow_multi else reordered_parsed[:1]
-
-                    # Apply design decision constraints during execution
-                    executed_results = []
-                    failed_at_index = -1
-                    bash_executed = False  # Track bash constraint (critical research finding)
-                    
-                    # If executing multiple nonblocking calls, run them concurrently for performance
-                    def _run_single_call(p):
-                        try:
-                            out = _exec_call(p.function, p.arguments)
-                        except Exception as e:
-                            out = {"error": str(e), "function": p.function}
-                        return (p, out)
-
-                    if len(calls_to_execute) > 1 and all(c.function in nonblocking_names for c in calls_to_execute):
-                        try:
-                            import concurrent.futures
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(calls_to_execute))) as pool:
-                                futures = [pool.submit(_run_single_call, p) for p in calls_to_execute]
-                                for fut in futures:
-                                    p, out = fut.result()
-                                    transcript.append({"tool": p.function, "result": out})
-                                    self._write_snapshot(output_json_path, model, messages, transcript)
-                                    executed_results.append((p, out))
-                                    if self._is_tool_failure(p.function, out) and failed_at_index < 0:
-                                        failed_at_index = 0
-                        except Exception as _:
-                            # Fallback to sequential if thread pool execution fails
-                            for i, p in enumerate(calls_to_execute):
-                                if p.function == "run_shell":
-                                    if bash_executed:
-                                        out = {"error": "Only one bash command allowed per turn (policy)", "skipped": True}
-                                        executed_results.append((p, out))
-                                        continue
-                                    bash_executed = True
-                                try:
-                                    out = _exec_call(p.function, p.arguments)
-                                except Exception as e:
-                                    out = {"error": str(e), "function": p.function}
-                                transcript.append({"tool": p.function, "result": out})
-                                self._write_snapshot(output_json_path, model, messages, transcript)
-                                executed_results.append((p, out))
-                                if self._is_tool_failure(p.function, out):
-                                    failed_at_index = i
-                                    break
-                    else:
-                        for i, p in enumerate(calls_to_execute):
-                            if p.function == "run_shell":
-                                if bash_executed:
-                                    out = {"error": "Only one bash command allowed per turn (policy)", "skipped": True}
-                                    executed_results.append((p, out))
-                                    continue
-                                bash_executed = True
-                            try:
-                                out = _exec_call(p.function, p.arguments)
-                            except Exception as e:
-                                out = {"error": str(e), "function": p.function}
-                            transcript.append({"tool": p.function, "result": out})
-                            self._write_snapshot(output_json_path, model, messages, transcript)
-                            executed_results.append((p, out))
-                            if self._is_tool_failure(p.function, out):
-                                failed_at_index = i
-                                break
-                        # CRITICAL: Enforce bash constraint (only one bash command per turn)
-                        if p.function == "run_shell":
-                            if bash_executed:
-                                error_out = {
-                                    "error": "Only one bash command allowed per turn (research constraint)",
-                                    "function": p.function,
-                                    "skipped": True
-                                }
-                                executed_results.append((p, error_out))
-                                continue
-                            bash_executed = True
-                        try:
-                            out = _exec_call(p.function, p.arguments)
-                        except Exception as e:
-                            out = {"error": str(e), "function": p.function}
-                        
-                        transcript.append({"tool": p.function, "result": out})
-                        self._write_snapshot(output_json_path, model, messages, transcript)
-                        executed_results.append((p, out))
-                        
-                        # SoTA COMPLETION DETECTION: Enhanced tool-based completion analysis
-                        if isinstance(out, dict) and out.get("action") == "complete":
-                            # Run SoTA completion detection with tool results
-                            completion_analysis = self._detect_completion_sota(
-                                msg_content="",  # No message content for tool-based completion
-                                choice_finish_reason=None,
-                                tool_results=[out]
-                            )
-                            
-                            # Add enhanced completion tracking
-                            transcript.append({
-                                "tool_completion_detected": {
-                                    "method": completion_analysis["method"],
-                                    "confidence": completion_analysis["confidence"],
-                                    "reason": completion_analysis["reason"],
-                                    "tool_result": out
-                                }
-                            })
-                            
-                            # Format and show all executed results including the completion
-                            chunks = []
-                            for tool_parsed, tool_result in executed_results:
-                                formatted_output = self._format_tool_output(tool_parsed.function, tool_result, tool_parsed.arguments)
-                                chunks.append(formatted_output)
-                            
-                            provider_tool_msg = "\n\n".join(chunks)
-                            provider_messages.append({"role": "user", "content": provider_tool_msg})
-                            self._append_markdown(output_md_path, [{"role": "User", "content": provider_tool_msg}])
-                            
-                            if stream_responses:
-                                print(f"[stop] reason={completion_analysis['method']} confidence={completion_analysis['confidence']:.2f} - {completion_analysis['reason']}")
-                            self._write_snapshot(output_json_path, model, messages, transcript)
-                            return {"messages": messages, "transcript": transcript}
-                        
-                        # Check for failure
-                        if self._is_tool_failure(p.function, out):
-                            failed_at_index = i
-                            break
-                    
-                    # Format results with failure handling and relay according to strategy
-                    chunks = []
-                    
-                    if failed_at_index >= 0:
-                        # Tool failed - show executed results and cancellation message
-                        for j, (tool_parsed, tool_result) in enumerate(executed_results):
-                            if j == failed_at_index:
-                                # Show the failed tool with error formatting
-                                if tool_parsed.function == "run_shell":
-                                    stdout = tool_result.get("stdout", "")
-                                    stderr = tool_result.get("stderr", "")
-                                    exit_code = tool_result.get("exit", 0)
-                                    error_msg = f"Command failed with exit code {exit_code}"
-                                    if stderr:
-                                        error_msg += f"\nstderr: {stderr}"
-                                    chunks.append(f"<BASH_RESULT>\n{stdout}\n{error_msg}\n</BASH_RESULT>")
-                                else:
-                                    error_msg = tool_result.get("error", "Unknown error")
-                                    chunks.append(f"<TOOL_ERROR tool=\"{tool_parsed.function}\">\n{error_msg}\n</TOOL_ERROR>")
-                            else:
-                                # Show successful tool normally
-                                formatted_output = self._format_tool_output(tool_parsed.function, tool_result, tool_parsed.arguments)
-                                chunks.append(formatted_output)
-                        
-                        # Add cancellation message  
-                        remaining_count = len(reordered_parsed) - failed_at_index - 1
-                        if remaining_count > 0:
-                            chunks.append(f"\nThe remaining {remaining_count} tool call(s) were cancelled due to the failure of the above call.")
-                    else:
-                        # All tools succeeded - show all results normally
-                        for tool_parsed, tool_result in executed_results:
-                            formatted_output = self._format_tool_output(tool_parsed.function, tool_result, tool_parsed.arguments)
-                            chunks.append(formatted_output)
-
-                    # Add tool result messages to main messages array for debugging
-                    for tool_parsed, tool_result in executed_results:
-                        formatted_output = self._format_tool_output(tool_parsed.function, tool_result, tool_parsed.arguments)
-                        tool_result_entry = {
-                            "role": "tool_result",
-                            "content": formatted_output,
-                            "tool_calls": [{
-                                "id": f"text_call_{tool_parsed.function}",
-                                "function": {"name": tool_parsed.function},
-                                "result": tool_result,
-                                "syntax_type": "custom-pythonic"
-                            }]
-                        }
-                        messages.append(tool_result_entry)
-
-                    # Get turn strategy flow configuration for text-based tools
-                    turn_cfg = self.config.get("turn_strategy", {}) if isinstance(self.config, dict) else {}
-                    flow_strategy = turn_cfg.get("flow", "assistant_continuation").lower()
-                    
-                    if flow_strategy == "assistant_continuation":
-                        # ASSISTANT CONTINUATION PATTERN: Create assistant message with tool results
-                        provider_tool_msg = "\n\n".join(chunks)
-                        assistant_continuation = {
-                            "role": "assistant",
-                            "content": f"\n\nTool execution results:\n{provider_tool_msg}"
-                        }
-                        messages.append(assistant_continuation)
-                        provider_messages.append(assistant_continuation.copy())
-                        self._append_markdown(output_md_path, [{"role": "Assistant", "content": assistant_continuation["content"]}])
-                    else:
-                        # USER INTERLEAVED PATTERN: Traditional user message relay
-                        provider_tool_msg = "\n\n".join(chunks)
-                        provider_messages.append({"role": "user", "content": provider_tool_msg})
-                        self._append_markdown(output_md_path, [{"role": "User", "content": provider_tool_msg}])
-                    
-                    # Continue next step
-                    continue
-
-            if msg.tool_calls:
-                # Execute provider-native tool calls and relay results using provider-supported 'tool' role
-                turn_cfg = self.config.get("turn_strategy", {}) if isinstance(self.config, dict) else {}
-                relay_strategy = (turn_cfg.get("relay") or "tool_role").lower()
-
-                tool_messages_to_relay: List[Dict[str, Any]] = []
-
                 try:
-                    # 1) Append the assistant message that contains tool_calls to maintain linkage
-                    try:
-                        tool_calls_payload = []
-                        for tc in msg.tool_calls:
-                            fn_name = getattr(getattr(tc, "function", None), "name", None)
-                            arg_str = getattr(getattr(tc, "function", None), "arguments", "{}")
-                            tool_calls_payload.append({
-                                "id": getattr(tc, "id", None),
-                                "type": "function",
-                                "function": {"name": fn_name, "arguments": arg_str if isinstance(arg_str, str) else json.dumps(arg_str or {})},
-                            })
-                        
-                        # CRITICAL: Add assistant message with tool calls to BOTH arrays
-                        # Enhanced assistant entry with syntax type metadata
-                        enhanced_tool_calls = []
-                        for tc in tool_calls_payload:
-                            enhanced_tc = tc.copy()
-                            enhanced_tc["syntax_type"] = "openai"  # Native OpenAI function calling
-                            enhanced_tool_calls.append(enhanced_tc)
-                        
-                        assistant_entry = {
-                            "role": "assistant",
-                            "content": msg.content,
-                            "tool_calls": enhanced_tool_calls,
-                        }
-                        messages.append(assistant_entry)  # For complete session history in JSON output
-                        provider_messages.append({"role": "assistant", "content": msg.content, "tool_calls": tool_calls_payload})  # For provider (no enhanced fields)
-                        
-                        # Add to transcript for debugging
-                        transcript.append({
-                            "assistant_with_tool_calls": {
-                                "content": msg.content,
-                                "tool_calls_count": len(msg.tool_calls),
-                                "tool_calls": [tc["function"]["name"] for tc in tool_calls_payload]
-                            }
-                        })
-                    except Exception:
-                        pass
-
-                    # 2) Execute calls and prepare relay of results (with nonblocking concurrency policy)
-                    turn_cfg = self.config.get("turn_strategy", {}) if isinstance(self.config, dict) else {}
-                    conc_cfg = self.config.get("concurrency", {}) if isinstance(self.config, dict) else {}
-                    nonblocking_names = set(conc_cfg.get("nonblocking_tools", [])) or set([
-                        'apply_unified_patch', 'apply_search_replace', 'create_file_from_block',
-                        'read', 'read_file', 'glob', 'grep', 'list', 'list_dir', 'patch'
-                    ])
-
-                    calls: List[Dict[str, Any]] = []
-                    for tc in msg.tool_calls:
-                        fn = getattr(getattr(tc, "function", None), "name", None)
-                        call_id = getattr(tc, "id", None)
-                        arg_str = getattr(getattr(tc, "function", None), "arguments", "{}")
-                        try:
-                            args = json.loads(arg_str) if isinstance(arg_str, str) else (arg_str or {})
-                        except Exception:
-                            args = {}
-                        if fn:
-                            calls.append({"fn": fn, "call_id": call_id, "args": args})
-
-                    only_nonblocking = all(c["fn"] in nonblocking_names for c in calls) if calls else False
-
-                    def _exec_native_call(fn_name: str, args: Dict[str, Any]):
-                        try:
-                            if self.enhanced_executor:
-                                import asyncio
-                                async def async_exec_raw(tc_obj):
-                                    return self._exec_raw(tc_obj)
-                                try:
-                                    loop = asyncio.get_event_loop()
-                                    if loop.is_closed():
-                                        raise RuntimeError("Loop is closed")
-                                except RuntimeError:
-                                    loop = asyncio.new_event_loop()
-                                    asyncio.set_event_loop(loop)
-                                return loop.run_until_complete(
-                                    self.enhanced_executor.execute_tool_call({"function": fn_name, "arguments": args}, async_exec_raw)
-                                )
-                            else:
-                                return self._exec_raw({"function": fn_name, "arguments": args})
-                        except Exception as e:
-                            return {"error": str(e), "function": fn_name}
-
-                    results: List[Dict[str, Any]] = []
-                    if only_nonblocking and len(calls) > 1:
-                        # Run nonblocking tools concurrently
-                        try:
-                            import concurrent.futures
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(calls))) as pool:
-                                future_map = {pool.submit(_exec_native_call, c["fn"], c["args"]): c for c in calls}
-                                for fut in future_map:
-                                    out = fut.result()
-                                    c = future_map[fut]
-                                    transcript.append({"tool": c["fn"], "result": out})
-                                    self._write_snapshot(output_json_path, model, messages, transcript)
-                                    results.append({"fn": c["fn"], "args": c["args"], "call_id": c["call_id"], "out": out})
-                        except Exception:
-                            # Fallback to sequential
-                            for c in calls:
-                                out = _exec_native_call(c["fn"], c["args"])
-                                transcript.append({"tool": c["fn"], "result": out})
-                                self._write_snapshot(output_json_path, model, messages, transcript)
-                                results.append({"fn": c["fn"], "args": c["args"], "call_id": c["call_id"], "out": out})
-                    else:
-                        # Respect single-tool-per-turn policy unless explicitly multiple allowed
-                        allow_multi = bool(turn_cfg.get("allow_multiple_per_turn", False))
-                        run_list = calls if allow_multi else (calls[:1] if calls else [])
-                        for c in run_list:
-                            out = _exec_native_call(c["fn"], c["args"])
-                            transcript.append({"tool": c["fn"], "result": out})
-                            self._write_snapshot(output_json_path, model, messages, transcript)
-                            results.append({"fn": c["fn"], "args": c["args"], "call_id": c["call_id"], "out": out})
-
-                    # Get turn strategy flow configuration
-                    flow_strategy = turn_cfg.get("flow", "assistant_continuation").lower()
-                    
-                    # Relay results based on flow strategy
-                    if flow_strategy == "assistant_continuation":
-                        # ASSISTANT CONTINUATION PATTERN: Append tool results to assistant messages
-                        all_results_text = []
-                        for r in results:
-                            formatted_output = self._format_tool_output(r["fn"], r["out"], r["args"])
-                            call_id = r.get("call_id")
-                            
-                            # Always add tool result to main messages array for debugging
-                            tool_result_entry = {
-                                "role": "tool_result",
-                                "content": formatted_output,
-                                "tool_calls": [{
-                                    "id": call_id or f"native_call_{r['fn']}",
-                                    "function": {"name": r["fn"]},
-                                    "result": r["out"],
-                                    "syntax_type": "openai"
-                                }]
-                            }
-                            messages.append(tool_result_entry)
-                            all_results_text.append(formatted_output)
-                        
-                        # Create assistant continuation message with tool results
-                        continuation_content = f"\n\nTool execution results:\n" + "\n\n".join(all_results_text)
-                        assistant_continuation = {
-                            "role": "assistant", 
-                            "content": continuation_content
-                        }
-                        messages.append(assistant_continuation)
-                        provider_messages.append(assistant_continuation.copy())
-                    else:
-                        # USER INTERLEAVED PATTERN: Traditional relay via user/tool messages
-                        for r in results:
-                            formatted_output = self._format_tool_output(r["fn"], r["out"], r["args"])
-                            call_id = r.get("call_id")
-                            
-                            # Always add tool result to main messages array for debugging
-                            tool_result_entry = {
-                                "role": "tool_result",
-                                "content": formatted_output,
-                                "tool_calls": [{
-                                    "id": call_id or f"native_call_{r['fn']}",
-                                    "function": {"name": r["fn"]},
-                                    "result": r["out"],
-                                    "syntax_type": "openai"
-                                }]
-                            }
-                            messages.append(tool_result_entry)
-                            
-                            if relay_strategy == "tool_role" and call_id:
-                                # Use provider adapter to create proper tool result message
-                                provider_id = provider_router.parse_model_id(model)[0]
-                                adapter = provider_adapter_manager.get_adapter(provider_id)
-                                tool_result_msg = adapter.create_tool_result_message(call_id, r["fn"], r["out"])
-                                tool_messages_to_relay.append(tool_result_msg)
-                            else:
-                                provider_messages.append({"role": "user", "content": formatted_output})
-
-                        # If using tool-role relay, append all tool messages and continue loop
-                        if tool_messages_to_relay:
-                            provider_messages.extend(tool_messages_to_relay)
-                            # Do not add any synthetic user messages; let the model continue the assistant turn
-                    continue
+                    if getattr(self.logger_v2, "run_dir", None):
+                        self.logger_v2.append_text(
+                            "conversation/conversation.md",
+                            self.md_writer.system(warning_text),
+                        )
                 except Exception:
-                    # On relay error, fall back to legacy behavior (append as user)
+                    pass
+                try:
+                    session_state.set_provider_metadata("streaming_disabled", True)
+                except Exception:
+                    pass
+                try:
+                    print(warning_text)
+                except Exception:
+                    pass
+            result = runtime.invoke(
+                client=client,
+                model=model,
+                messages=send_messages,
+                tools=tools_schema,
+                stream=False,
+                context=runtime_context,
+            )
+            used_streaming = False
+
+        return result, used_streaming
+
+        steps_taken = (step_index + 1) if step_index >= 0 else 0
+
+        if not getattr(session_state, "completion_summary", None):
+            reason = "max_steps_exhausted" if max_steps and steps_taken >= max_steps and not completed else "loop_terminated"
+            session_state.completion_summary = {
+                "completed": completed,
+                "reason": reason,
+                "method": "loop_exit",
+            }
+
+        session_state.completion_summary.setdefault("completed", completed)
+        session_state.completion_summary.setdefault("steps_taken", steps_taken)
+        session_state.completion_summary.setdefault("max_steps", max_steps)
+
+        # Final snapshot and return
+        try:
+            diff = self.vcs({"action": "diff", "params": {"staged": False, "unified": 3}})
+        except Exception:
+            diff = {"ok": False, "data": {"diff": ""}}
+
+        session_state.write_snapshot(output_json_path, model, diff)
+        if stream_responses:
+            print(f"[stop] reason=end-of-loop steps={steps_taken}")
+
+        completion_summary = session_state.completion_summary or {}
+        completion_reason = completion_summary.get("reason", "unknown")
+        result = {
+            "messages": session_state.messages,
+            "transcript": session_state.transcript,
+            "completion_summary": completion_summary,
+            "completion_reason": completion_reason,
+            "completed": completion_summary.get("completed", False),
+        }
+        return result
+    
+    def _get_model_response(
+        self,
+        runtime,
+        client,
+        model: str,
+        tool_prompt_mode: str,
+        tool_defs: List[ToolDefinition],
+        active_dialect_names: List[str],
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+        stream_responses: bool,
+        local_tools_prompt: str
+    ) -> ProviderResult:
+        """Get response from the model with proper tool configuration."""
+        # Build per-turn message list
+        send_messages = [dict(m) for m in session_state.provider_messages]
+        
+        # Ensure last message is user; if not, append a user wrapper for tools prompt
+        if not send_messages or send_messages[-1].get("role") != "user":
+            send_messages.append({"role": "user", "content": ""})
+        
+        # Add tool prompts based on mode
+        turn_index = len(session_state.transcript) + 1
+        per_turn_written_text = None
+        if tool_prompt_mode in ("per_turn_append", "system_and_per_turn"):
+            # Build full tool directive text (restored from original logic)
+            tool_directive_text = (
+                "\n\nSYSTEM MESSAGE - AVAILABLE TOOLS\n"
+                f"<FUNCTIONS>\n{local_tools_prompt}\n</FUNCTIONS>\n"
+                "MANDATORY: Respond ONLY with one or more tool calls using <TOOL_CALL> ..., with <BASH>...</BASH> for shell, or with diff blocks (SEARCH/REPLACE for edits; unified diff or OpenCode Add File for new files).\n"
+                "You may call multiple tools in one reply; non-blocking tools may run concurrently.\n"
+                "Some tools are blocking and must run alone in sequence.\n"
+                "Do NOT include any extra prose beyond tool calls or diff blocks.\n"
+                "When you deem the task fully complete, call mark_task_complete().\n"
+                "NEVER use bash to write large file contents (heredocs, echo >>). For files: call create_file() then apply a diff block for contents.\n"
+                "Do NOT include extra prose.\nEND SYSTEM MESSAGE\n"
+            )
+            send_messages[-1]["content"] = (send_messages[-1].get("content") or "") + tool_directive_text
+            markdown_logger.log_tool_availability([t.name for t in tool_defs])
+            per_turn_written_text = tool_directive_text
+        elif tool_prompt_mode == "system_compiled_and_persistent_per_turn":
+            # Add per-turn availability
+            compiler = get_compiler()
+            enabled_tools = [t.name for t in tool_defs]
+            per_turn_availability = compiler.format_per_turn_availability(enabled_tools, active_dialect_names)
+            
+            # Permanently append to the actual message history
+            send_messages[-1]["content"] = (send_messages[-1].get("content") or "") + "\n\n" + per_turn_availability
+            session_state.provider_messages[-1]["content"] = (session_state.provider_messages[-1].get("content") or "") + "\n\n" + per_turn_availability
+            per_turn_written_text = per_turn_availability
+
+        # Persist per-turn availability content and add transcript section
+        try:
+            if per_turn_written_text and self.logger_v2.run_dir:
+                rel = self.prompt_logger.save_per_turn(turn_index, per_turn_written_text)
+                self.logger_v2.append_text("conversation/conversation.md", self.md_writer.tools_available_temp("Per-turn tools prompt appended.", rel))
+        except Exception:
+            pass
+        
+        # Add context to transcript  
+        session_state.add_transcript_entry({
+            "tools_context": {
+                "available_tools": _dump_tool_defs(tool_defs),
+                "compiled_tools_prompt": local_tools_prompt,
+            }
+        })
+        
+        # Determine if native tools should be used
+        provider_tools_cfg = getattr(self, "_provider_tools_effective", None) or dict((self.config.get("provider_tools") or {}))
+        effective_config = dict(self.config)
+        effective_config["provider_tools"] = provider_tools_cfg
+        self._provider_tools_effective = provider_tools_cfg
+        use_native_tools = provider_router.should_use_native_tools(model, effective_config)
+        tools_schema = None
+        if use_native_tools and getattr(self, "current_native_tools", None):
+            try:
+                provider_id = provider_router.parse_model_id(model)[0]
+                native_tools = getattr(self, 'current_native_tools', [])
+                if native_tools:
+                    tools_schema = provider_adapter_manager.translate_tools_to_native_schema(native_tools, provider_id)
+                    # Persist provider tools provided
                     try:
-                        if tool_messages_to_relay:
-                            fallback_blob = "\n\n".join([m.get("content", "") for m in tool_messages_to_relay])
-                            provider_messages.append({"role": "user", "content": fallback_blob})
+                        if self.logger_v2.run_dir and tools_schema:
+                            self.provider_logger.save_tools_provided(turn_index, tools_schema)
+                            # Also append transcript section listing tool IDs if available
+                            ids = []
+                            try:
+                                # OpenAI style
+                                for it in tools_schema:
+                                    fn = (it.get("function") or {}).get("name")
+                                    if fn:
+                                        ids.append(str(fn))
+                            except Exception:
+                                pass
+                            self.logger_v2.append_text("conversation/conversation.md", self.md_writer.provider_tools_provided(ids or ["(see JSON)"], f"provider_native/tools_provided/turn_{turn_index}.json"))
                     except Exception:
                         pass
-                    continue
-            else:
-                # normal assistant content
-                if msg.content:
-                    assistant_entry = {"role": "assistant", "content": msg.content}
-                    messages.append(assistant_entry)
-                    provider_messages.append(assistant_entry.copy())
-                    transcript.append({"assistant": msg.content})
-                    # Snapshot after assistant content
-                    self._write_snapshot(output_json_path, model, messages, transcript)
-                # SoTA COMPLETION DETECTION: Use comprehensive multi-method detection
-                completion_analysis = self._detect_completion_sota(
-                    msg_content=msg.content or "",
-                    choice_finish_reason=getattr(choice, "finish_reason", None),
-                    tool_results=[]  # Tool results handled separately above
+            except Exception:
+                tools_schema = None
+        
+        # Persist raw request (pre-call)
+        try:
+            if self.logger_v2.include_raw:
+                self.api_recorder.save_request(len(session_state.transcript) + 1, {
+                    "model": model,
+                    "messages": send_messages,
+                    "tools": tools_schema,
+                })
+        except Exception:
+            pass
+
+        # Make API call
+        runtime_context = ProviderRuntimeContext(
+            session_state=session_state,
+            agent_config=self.config,
+            stream=stream_responses,
+            extra={
+                "turn_index": len(session_state.transcript) + 1,
+                "model": model,
+            },
+        )
+
+        result, _ = self._invoke_runtime_with_streaming(
+            runtime,
+            client,
+            model,
+            send_messages,
+            tools_schema,
+            stream_responses,
+            runtime_context,
+            session_state,
+            markdown_logger,
+        )
+
+
+        # Persist raw response (post-call)
+        try:
+            if self.logger_v2.include_raw:
+                raw_payload = result.raw_response
+                if hasattr(raw_payload, "model_dump"):
+                    serialized = raw_payload.model_dump()  # type: ignore[attr-defined]
+                elif isinstance(raw_payload, dict):
+                    serialized = raw_payload
+                else:
+                    try:
+                        serialized = dict(raw_payload)
+                    except Exception:
+                        serialized = None
+                if serialized is not None:
+                    self.api_recorder.save_response(
+                        len(session_state.transcript) + 1,
+                        serialized,
+                    )
+        except Exception:
+            pass
+
+        return result
+    
+    def _legacy_message_view(self, provider_message: ProviderMessage) -> SimpleNamespace:
+        """Create a SimpleNamespace compatible with legacy helper functions."""
+
+        tool_calls_ns: List[SimpleNamespace] = []
+        for call in provider_message.tool_calls:
+            function_ns = SimpleNamespace(
+                name=call.name,
+                arguments=call.arguments,
+            )
+            tool_calls_ns.append(
+                SimpleNamespace(
+                    id=call.id,
+                    type=call.type,
+                    function=function_ns,
                 )
-                
-                # Log completion analysis for debugging
-                transcript.append({"completion_analysis": completion_analysis})
-                
-                # Apply confidence threshold for non-tool completions
-                confidence_threshold = self.completion_config.get("confidence_threshold", 0.6)
-                meets_threshold = (completion_analysis["method"] == "tool_based" or 
-                                 completion_analysis["confidence"] >= confidence_threshold)
-                
-                if completion_analysis["completed"] and meets_threshold:
-                    if stream_responses:
-                        print(f"[stop] reason={completion_analysis['method']} confidence={completion_analysis['confidence']:.2f} - {completion_analysis['reason']}")
-                    # Add completion summary to transcript
-                    transcript.append({
-                        "completion_detected": {
-                            "method": completion_analysis["method"],
-                            "confidence": completion_analysis["confidence"],
-                            "reason": completion_analysis["reason"],
-                            "content_analyzed": bool(msg.content),
-                            "threshold_met": meets_threshold
-                        }
-                    })
-                    break
-                elif completion_analysis["completed"] and not meets_threshold:
-                    # Log low-confidence completion attempts
-                    transcript.append({
-                        "completion_below_threshold": {
-                            "method": completion_analysis["method"],
-                            "confidence": completion_analysis["confidence"],
-                            "threshold": confidence_threshold,
-                            "reason": completion_analysis["reason"]
-                        }
-                    })
-        # Final snapshot
-        self._write_snapshot(output_json_path, model, messages, transcript)
-        # Emit stop reason for visibility
-        if stream_responses:
-            print(f"[stop] reason=end-of-loop steps={max_steps}")
-        return {"messages": messages, "transcript": transcript}
+            )
+        return SimpleNamespace(
+            role=provider_message.role,
+            content=provider_message.content,
+            tool_calls=tool_calls_ns,
+            raw_message=provider_message.raw_message,
+            finish_reason=provider_message.finish_reason,
+            index=provider_message.index,
+        )
 
+    def _log_provider_message(
+        self,
+        provider_message: ProviderMessage,
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+        stream_responses: bool,
+    ) -> None:
+        """Log the provider message and capture debug metadata."""
 
+        legacy_msg = self._legacy_message_view(provider_message)
+
+        try:
+            debug_tc = None
+            if getattr(legacy_msg, "tool_calls", None):
+                debug_tc = [
+                    {
+                        "id": getattr(tc, "id", None),
+                        "name": getattr(getattr(tc, "function", None), "name", None),
+                    }
+                    for tc in legacy_msg.tool_calls
+                ]
+            session_state.add_transcript_entry(
+                {
+                    "choice_debug": {
+                        "finish_reason": provider_message.finish_reason,
+                        "has_content": bool(getattr(legacy_msg, "content", None)),
+                        "tool_calls_len": len(legacy_msg.tool_calls)
+                        if getattr(legacy_msg, "tool_calls", None)
+                        else 0,
+                    }
+                }
+            )
+        except Exception:
+            pass
+
+        if getattr(legacy_msg, "content", None):
+            markdown_logger.log_assistant_message(str(legacy_msg.content))
+            try:
+                if self.logger_v2.run_dir:
+                    self.logger_v2.append_text(
+                        "conversation/conversation.md",
+                        self.md_writer.assistant(str(legacy_msg.content)),
+                    )
+            except Exception:
+                pass
+        
+        if stream_responses and getattr(legacy_msg, "content", None):
+            try:
+                print(str(legacy_msg.content))
+            except Exception:
+                pass
+    
+    def _process_model_output(
+        self,
+        provider_message: ProviderMessage,
+        caller,
+        tool_defs: List[ToolDefinition],
+        session_state: SessionState,
+        completion_detector: CompletionDetector,
+        markdown_logger: MarkdownLogger,
+        error_handler: ErrorHandler,
+        stream_responses: bool,
+        model: str,
+    ) -> bool:
+        """Process model output (tool calls or content) and return True if completion detected"""
+        msg = self._legacy_message_view(provider_message)
+
+        # Handle text-based tool calls
+        if not getattr(msg, "tool_calls", None) and (msg.content or ""):
+            return self._handle_text_tool_calls(
+                msg, caller, tool_defs, session_state, markdown_logger, 
+                error_handler, stream_responses
+            )
+        
+        # Handle native tool calls
+        if msg.tool_calls:
+            return self._handle_native_tool_calls(
+                msg, session_state, markdown_logger, error_handler, 
+                stream_responses, model
+            )
+        
+        # Handle regular assistant content (no tool calls)
+        if msg.content:
+            session_state.add_message({"role": "assistant", "content": msg.content})
+            session_state.add_transcript_entry({"assistant": msg.content})
+            
+            # Check for completion
+            completion_analysis = completion_detector.detect_completion(
+                msg_content=msg.content or "",
+                choice_finish_reason=provider_message.finish_reason,
+                tool_results=[],
+                agent_config=self.config
+            )
+            
+            session_state.add_transcript_entry({"completion_analysis": completion_analysis})
+            
+            if completion_analysis["completed"] and completion_detector.meets_threshold(completion_analysis):
+                if stream_responses:
+                    print(f"[stop] reason={completion_analysis['method']} confidence={completion_analysis['confidence']:.2f} - {completion_analysis['reason']}")
+                session_state.add_transcript_entry({
+                    "completion_detected": {
+                        "method": completion_analysis["method"],
+                        "confidence": completion_analysis["confidence"],
+                        "reason": completion_analysis["reason"],
+                        "content_analyzed": bool(msg.content),
+                        "threshold_met": completion_detector.meets_threshold(completion_analysis)
+                    }
+                })
+                if not getattr(session_state, "completion_summary", None):
+                    session_state.completion_summary = {
+                        "completed": True,
+                        "method": completion_analysis["method"],
+                        "reason": completion_analysis["reason"],
+                        "confidence": completion_analysis["confidence"],
+                        "source": "assistant_content",
+                        "analysis": completion_analysis,
+                    }
+                else:
+                    session_state.completion_summary.setdefault("completed", True)
+                    session_state.completion_summary.setdefault("method", completion_analysis["method"])
+                    session_state.completion_summary.setdefault("reason", completion_analysis["reason"])
+                    session_state.completion_summary.setdefault("confidence", completion_analysis["confidence"])
+                return True
+        
+        return False
+    
+    def _handle_text_tool_calls(
+        self,
+        msg,
+        caller,
+        tool_defs: List[ToolDefinition],
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+        error_handler: ErrorHandler,
+        stream_responses: bool
+    ) -> bool:
+        """Handle text-based tool calls (simplified version)"""
+        parsed = caller.parse_all(msg.content, tool_defs)
+        if not parsed:
+            return False
+        
+        # Add assistant message with synthetic tool calls to main messages (for debugging) only
+        # Do NOT add synthetic tool calls to provider messages - that would confuse the provider
+        synthetic_tool_calls = self.message_formatter.create_synthetic_tool_calls(parsed)
+        assistant_entry = {
+            "role": "assistant", 
+            "content": msg.content,
+            "tool_calls": synthetic_tool_calls
+        }
+        session_state.add_message(assistant_entry, to_provider=False)  # Only to main messages, NOT provider
+        
+        # Add a simple content-only assistant message to provider messages
+        session_state.add_message({"role": "assistant", "content": msg.content}, to_provider=True)
+        
+        session_state.add_transcript_entry({
+            "assistant_with_text_tool_calls": {
+                "content": msg.content,
+                "parsed_tools_count": len(parsed),
+                "parsed_tools": [p.function for p in parsed]
+            }
+        })
+        
+        # Execute tool calls
+        executed_results, failed_at_index, execution_error = self.agent_executor.execute_parsed_calls(
+            parsed, 
+            self._exec_raw,
+            transcript_callback=session_state.add_transcript_entry
+        )
+        
+        # Handle execution errors
+        if execution_error:
+            if execution_error.get("validation_failed"):
+                error_msg = error_handler.handle_validation_error(execution_error)
+            elif execution_error.get("constraint_violation"):
+                error_msg = error_handler.handle_constraint_violation(execution_error["error"])
+            else:
+                error_msg = f"<EXECUTION_ERROR>\n{execution_error['error']}\n</EXECUTION_ERROR>"
+            
+            session_state.add_message({"role": "user", "content": error_msg}, to_provider=True)
+            markdown_logger.log_user_message(error_msg)
+            
+            if stream_responses:
+                print(f"[error] {execution_error.get('error', 'Unknown error')}")
+            return False
+        
+        # Check for completion via tool results
+        for tool_parsed, tool_result in executed_results:
+            if isinstance(tool_result, dict) and tool_result.get("action") == "complete":
+                # Format and show all executed results including the completion
+                chunks = self.message_formatter.format_execution_results(executed_results, failed_at_index, len(parsed))
+                provider_tool_msg = "\n\n".join(chunks)
+                session_state.add_message({"role": "user", "content": provider_tool_msg}, to_provider=True)
+                markdown_logger.log_user_message(provider_tool_msg)
+                
+                if not getattr(session_state, "completion_summary", None):
+                    session_state.completion_summary = {
+                        "completed": True,
+                        "method": "tool_mark_task_complete",
+                        "reason": "mark_task_complete",
+                        "confidence": 1.0,
+                        "tool": tool_parsed.function,
+                        "tool_result": tool_result,
+                        "source": "tool_call",
+                    }
+                else:
+                    session_state.completion_summary.setdefault("completed", True)
+                    session_state.completion_summary.setdefault("reason", "mark_task_complete")
+                    session_state.completion_summary.setdefault("method", "tool_mark_task_complete")
+
+                if stream_responses:
+                    print(f"[stop] reason=tool_based confidence=1.0 - mark_task_complete() called")
+                return True
+        
+        # Persist per-tool results as artifacts and collect links
+        artifact_links: list[str] = []
+        try:
+            if self.logger_v2.run_dir:
+                for idx, (tool_parsed, tool_result) in enumerate(executed_results):
+                    rel = self.message_formatter.write_tool_result_file(self.logger_v2.run_dir, len(session_state.transcript) + 1, idx, tool_parsed.function, tool_result)
+                    if rel:
+                        artifact_links.append(rel)
+        except Exception:
+            pass
+
+        # Format and relay results
+        chunks = self.message_formatter.format_execution_results(executed_results, failed_at_index, len(parsed))
+        
+        # Add tool result messages to main messages array
+        for tool_parsed, tool_result in executed_results:
+            tool_result_entry = self.message_formatter.create_tool_result_entry(
+                tool_parsed.function, tool_result, syntax_type="custom-pythonic"
+            )
+            session_state.add_message(tool_result_entry, to_provider=False)
+        
+        # Get turn strategy flow configuration
+        turn_cfg = self.config.get("turn_strategy", {})
+        flow_strategy = turn_cfg.get("flow", "assistant_continuation").lower()
+        
+        if flow_strategy == "assistant_continuation":
+            # ASSISTANT CONTINUATION PATTERN: Create assistant message with tool results
+            provider_tool_msg = "\n\n".join(chunks)
+            assistant_continuation = {
+                "role": "assistant",
+                "content": f"\n\nTool execution results:\n{provider_tool_msg}"
+            }
+            session_state.add_message(assistant_continuation)
+            markdown_logger.log_assistant_message(assistant_continuation["content"])
+            try:
+                if self.logger_v2.run_dir:
+                    # First, log the assistant continuation text to conversation
+                    self.logger_v2.append_text("conversation/conversation.md", self.md_writer.assistant(assistant_continuation["content"]))
+                    # Then, add a compact artifact links section once per turn
+                    if artifact_links:
+                        self.logger_v2.append_text("conversation/conversation.md", self.md_writer.text_tool_results("Tool execution results appended.", artifact_links))
+            except Exception:
+                pass
+        else:
+            # USER INTERLEAVED PATTERN: Traditional user message relay
+            provider_tool_msg = "\n\n".join(chunks)
+            session_state.add_message({"role": "user", "content": provider_tool_msg}, to_provider=True)
+            markdown_logger.log_user_message(provider_tool_msg)
+            try:
+                if self.logger_v2.run_dir:
+                    # In user-interleaved, still present a single compact artifact links section
+                    if artifact_links:
+                        self.logger_v2.append_text("conversation/conversation.md", self.md_writer.text_tool_results("Tool execution results appended.", artifact_links))
+            except Exception:
+                pass
+        
+        return False
+    
+    def _handle_native_tool_calls(
+        self,
+        msg,
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+        error_handler: ErrorHandler,
+        stream_responses: bool,
+        model: str
+    ) -> bool:
+        """Handle native tool calls with proper provider tool result formatting"""
+        # Execute provider-native tool calls and relay results using provider-supported 'tool' role
+        turn_cfg = self.config.get("turn_strategy", {})
+        relay_strategy = (turn_cfg.get("relay") or "tool_role").lower()
+        
+        tool_messages_to_relay: List[Dict[str, Any]] = []
+        
+        try:
+            # 1) Append the assistant message that contains tool_calls to maintain linkage
+            try:
+                tool_calls_payload = []
+                for tc in msg.tool_calls:
+                    fn_name = getattr(getattr(tc, "function", None), "name", None)
+                    arg_str = getattr(getattr(tc, "function", None), "arguments", "{}")
+                    tool_calls_payload.append({
+                        "id": getattr(tc, "id", None),
+                        "type": "function",
+                        "function": {"name": fn_name, "arguments": arg_str if isinstance(arg_str, str) else json.dumps(arg_str or {})},
+                    })
+                # Persist provider-native tool calls and add transcript section
+                try:
+                    if self.logger_v2.run_dir and tool_calls_payload:
+                        turn_index = len(session_state.transcript) + 1
+                        self.provider_logger.save_tool_calls(turn_index, tool_calls_payload)
+                        short = "\n".join([f"- {c['function']['name']} (id={c.get('id')})" for c in tool_calls_payload])
+                        self.logger_v2.append_text("conversation/conversation.md", self.md_writer.provider_tool_calls(short, f"provider_native/tool_calls/turn_{turn_index}.json"))
+                except Exception:
+                    pass
+                
+                # CRITICAL: Add assistant message with tool calls to BOTH arrays
+                # Enhanced assistant entry with syntax type metadata
+                enhanced_tool_calls = self.message_formatter.create_enhanced_tool_calls(tool_calls_payload)
+                
+                assistant_entry = {
+                    "role": "assistant",
+                    "content": msg.content,
+                    "tool_calls": enhanced_tool_calls,
+                }
+                session_state.add_message(assistant_entry, to_provider=False)  # For complete session history in JSON output
+                session_state.add_message({"role": "assistant", "content": msg.content, "tool_calls": tool_calls_payload}, to_provider=True)  # For provider (no enhanced fields)
+                
+                # Add to transcript for debugging
+                session_state.add_transcript_entry({
+                    "assistant_with_tool_calls": {
+                        "content": msg.content,
+                        "tool_calls_count": len(msg.tool_calls),
+                        "tool_calls": [tc["function"]["name"] for tc in tool_calls_payload]
+                    }
+                })
+            except Exception:
+                pass
+            
+            # 2) Execute calls via shared agent executor to honor concurrency + alias policies
+            parsed_calls: List[Any] = []
+            for tc in msg.tool_calls:
+                fn = getattr(getattr(tc, "function", None), "name", None)
+                call_id = getattr(tc, "id", None)
+                arg_str = getattr(getattr(tc, "function", None), "arguments", "{}")
+                try:
+                    args = json.loads(arg_str) if isinstance(arg_str, str) else (arg_str or {})
+                except Exception:
+                    args = {}
+                if not fn:
+                    continue
+                canonical_fn = self.agent_executor.canonical_tool_name(fn)
+                call_obj = SimpleNamespace(function=canonical_fn, arguments=args, provider_name=fn, call_id=call_id)
+                parsed_calls.append(call_obj)
+
+            executed_results: List[tuple] = []
+            failed_at_index = -1
+            execution_error: Optional[Dict[str, Any]] = None
+
+            if parsed_calls:
+                executed_results, failed_at_index, execution_error = self.agent_executor.execute_parsed_calls(
+                    parsed_calls,
+                    self._exec_raw,
+                    transcript_callback=session_state.add_transcript_entry,
+                )
+
+            if execution_error:
+                if execution_error.get("validation_failed"):
+                    error_msg = error_handler.handle_validation_error(execution_error)
+                elif execution_error.get("constraint_violation"):
+                    error_msg = error_handler.handle_constraint_violation(execution_error["error"])
+                else:
+                    error_msg = f"<EXECUTION_ERROR>\n{execution_error['error']}\n</EXECUTION_ERROR>"
+
+                session_state.add_message({"role": "user", "content": error_msg}, to_provider=True)
+                markdown_logger.log_user_message(error_msg)
+                if stream_responses:
+                    print(f"[error] {execution_error.get('error', 'Unknown error')}")
+                return False
+
+            results: List[Dict[str, Any]] = []
+            for parsed, tool_result in executed_results:
+                call_id = getattr(parsed, "call_id", None)
+                provider_name = getattr(parsed, "provider_name", parsed.function)
+                results.append({
+                    "fn": parsed.function,
+                    "provider_fn": provider_name,
+                    "out": tool_result,
+                    "args": parsed.arguments,
+                    "call_id": call_id,
+                    "failed": False,
+                })
+            
+            # Get turn strategy flow configuration
+            flow_strategy = turn_cfg.get("flow", "assistant_continuation").lower()
+            
+            # Persist provider-native tool results before relay
+            try:
+                if self.logger_v2.run_dir and results:
+                    turn_index = len(session_state.transcript) + 1
+                    persistable = []
+                    for r in results:
+                        persistable.append({
+                            "fn": r["fn"],
+                            "provider_fn": r.get("provider_fn", r["fn"]),
+                            "call_id": r.get("call_id"),
+                            "args": r.get("args"),
+                            "out": r.get("out"),
+                        })
+                    self.provider_logger.save_tool_results(turn_index, persistable)
+                    short = "\n".join([f"- {r.get('provider_fn', r['fn'])} (id={r.get('call_id')})" for r in results])
+                    self.logger_v2.append_text("conversation/conversation.md", self.md_writer.provider_tool_results(short, f"provider_native/tool_results/turn_{turn_index}.json"))
+            except Exception:
+                pass
+
+            # Relay results based on flow strategy
+            if flow_strategy == "assistant_continuation":
+                # ASSISTANT CONTINUATION PATTERN: Append tool results to assistant messages
+                all_results_text = []
+                for r in results:
+                    formatted_output = self.message_formatter.format_tool_output(r["fn"], r["out"], r["args"])
+                    call_id = r.get("call_id")
+                    
+                    # Always add tool result to main messages array for debugging
+                    tool_result_entry = self.message_formatter.create_tool_result_entry(
+                        r["fn"], r["out"], call_id or f"native_call_{r['fn']}", "openai"
+                    )
+                    session_state.add_message(tool_result_entry, to_provider=False)
+                    all_results_text.append(formatted_output)
+                
+                # Create assistant continuation message with tool results
+                continuation_content = f"\n\nTool execution results:\n" + "\n\n".join(all_results_text)
+                assistant_continuation = {
+                    "role": "assistant", 
+                    "content": continuation_content
+                }
+                session_state.add_message(assistant_continuation)
+                markdown_logger.log_assistant_message(continuation_content)
+            else:
+                # USER INTERLEAVED PATTERN: Traditional relay via user/tool messages
+                for r in results:
+                    formatted_output = self.message_formatter.format_tool_output(r["fn"], r["out"], r["args"])
+                    call_id = r.get("call_id")
+                    
+                    # Always add tool result to main messages array for debugging
+                    tool_result_entry = self.message_formatter.create_tool_result_entry(
+                        r["fn"], r["out"], call_id or f"native_call_{r['fn']}", "openai"
+                    )
+                    session_state.add_message(tool_result_entry, to_provider=False)
+                    
+                    if relay_strategy == "tool_role" and call_id:
+                        # Use provider adapter to create proper tool result message
+                        provider_id = provider_router.parse_model_id(model)[0]
+                        adapter = provider_adapter_manager.get_adapter(provider_id)
+                        tool_result_msg = adapter.create_tool_result_message(call_id, r.get("provider_fn", r["fn"]), r["out"])
+                        tool_messages_to_relay.append(tool_result_msg)
+                    else:
+                        session_state.add_message({"role": "user", "content": formatted_output}, to_provider=True)
+                
+                # If using tool-role relay, append all tool messages and continue loop
+                if tool_messages_to_relay:
+                    session_state.provider_messages.extend(tool_messages_to_relay)
+                    # Do not add any synthetic user messages; let the model continue the assistant turn
+            
+            return False  # Continue the loop
+            
+        except Exception:
+            # On relay error, fall back to legacy behavior (append as user)
+            try:
+                if tool_messages_to_relay:
+                    fallback_blob = "\n\n".join([m.get("content", "") for m in tool_messages_to_relay])
+                    session_state.add_message({"role": "user", "content": fallback_blob}, to_provider=True)
+            except Exception:
+                pass
+            return False

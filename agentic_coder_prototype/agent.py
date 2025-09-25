@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
-from .agent_llm_openai import AgentOpenAI
+import ray
+from .agent_llm_openai import OpenAIConductor
+from .compilation.v2_loader import load_agent_config
 from .provider_routing import provider_router
 from .provider_adapters import provider_adapter_manager
-from .tool_calling.tool_yaml_loader import load_yaml_tools
-from .tool_calling.system_prompt_compiler import get_compiler
+from .compilation.tool_yaml_loader import load_yaml_tools
+from .compilation.system_prompt_compiler import get_compiler
 
 
 class AgenticCoder:
@@ -24,35 +27,94 @@ class AgenticCoder:
     def __init__(self, config_path: str, workspace_dir: Optional[str] = None):
         """Initialize the agentic coder with a config file."""
         self.config_path = config_path
-        self.workspace_dir = workspace_dir or f"agent_ws_{os.path.basename(config_path).split('.')[0]}"
+        # Load config first so we can honor V2 workspace.root
         self.config = self._load_config()
+        # Prefer v2 workspace.root if provided
+        v2_ws_root = None
+        try:
+            v2_ws_root = (self.config.get("workspace", {}) or {}).get("root")
+        except Exception:
+            v2_ws_root = None
+        self.workspace_dir = workspace_dir or v2_ws_root or f"agent_ws_{os.path.basename(config_path).split('.')[0]}"
         self.agent = None
+        self._local_mode = os.environ.get("RAY_SCE_LOCAL_MODE", "0") == "1"
         
     def _load_config(self) -> Dict[str, Any]:
-        """Load and validate configuration."""
-        with open(self.config_path, 'r') as f:
-            return json.load(f) if self.config_path.endswith('.json') else __import__('yaml').safe_load(f)
+        """Load and validate configuration (v2-aware)."""
+        try:
+            return load_agent_config(self.config_path)
+        except Exception:
+            # Fallback to legacy loader for resilience
+            with open(self.config_path, 'r') as f:
+                return json.load(f) if self.config_path.endswith('.json') else __import__('yaml').safe_load(f)
     
     def initialize(self) -> None:
         """Initialize the agent with the loaded configuration."""
-        # Create workspace if it doesn't exist
-        Path(self.workspace_dir).mkdir(exist_ok=True)
+        workspace_path = Path(self.workspace_dir)
+        if workspace_path.exists():
+            # Ensure each run starts from a clean clone workspace
+            shutil.rmtree(workspace_path)
+        workspace_path.mkdir(parents=True, exist_ok=True)
         
-        # Initialize the underlying agent
-        self.agent = AgentOpenAI(
-            config=self.config,
-            workspace_dir=self.workspace_dir
-        )
+        # Initialize Ray and underlying actor
+        if not self._local_mode:
+            try:
+                if not ray.is_initialized():
+                    ray.init()
+            except Exception:
+                self._local_mode = True
+
+        if self._local_mode:
+            print("[Ray disabled] Using local in-process execution mode.")
+            conductor_cls = OpenAIConductor.__ray_metadata__.modified_class
+            self.agent = conductor_cls(
+                workspace=self.workspace_dir,
+                config=self.config,
+                local_mode=True,
+            )
+        else:
+            self.agent = OpenAIConductor.remote(
+                workspace=self.workspace_dir,
+                config=self.config,
+            )
     
     def run_task(self, task: str, max_iterations: Optional[int] = None) -> Dict[str, Any]:
         """Run a single task and return results."""
         if not self.agent:
             self.initialize()
         
-        return self.agent.run_agent_session(
-            initial_prompt=task,
-            max_iterations=max_iterations or self.config.get('max_iterations', 20)
+        model = self._select_model()
+        steps = int(max_iterations or self.config.get('max_iterations', 12))
+        # If task is a file path, read it as the user prompt content; else use as-is
+        user_prompt = task
+        try:
+            p = Path(task)
+            if p.exists() and p.is_file():
+                user_prompt = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        # Run empty system prompt to allow v2 compiler to inject packs; user prompt carries content
+        if self._local_mode:
+            return self.agent.run_agentic_loop(
+                "",
+                user_prompt,
+                model,
+                max_steps=steps,
+                output_json_path=None,
+                stream_responses=False,
+                output_md_path=None,
+            )
+
+        ref = self.agent.run_agentic_loop.remote(
+            "",
+            user_prompt,
+            model,
+            max_steps=steps,
+            output_json_path=None,
+            stream_responses=False,
+            output_md_path=None,
         )
+        return ray.get(ref)
     
     def interactive_session(self) -> None:
         """Start an interactive session with the agent."""
@@ -68,7 +130,12 @@ class AgenticCoder:
                 if user_input.lower() in ['exit', 'quit']:
                     break
                 
-                result = self.agent.run_agent_session(initial_prompt=user_input, max_iterations=5)
+                model = self._select_model()
+                if self._local_mode:
+                    result = self.agent.run_agentic_loop("", user_input, model, max_steps=5)
+                else:
+                    ref = self.agent.run_agentic_loop.remote("", user_input, model, max_steps=5)
+                    result = ray.get(ref)
                 print(f"Agent completed with status: {result.get('completion_reason', 'unknown')}")
                 
             except KeyboardInterrupt:
@@ -87,6 +154,17 @@ class AgenticCoder:
             for filename in filenames:
                 files.append(os.path.relpath(os.path.join(root, filename), self.workspace_dir))
         return files
+
+    def _select_model(self) -> str:
+        try:
+            providers = self.config.get("providers", {})
+            default_model = providers.get("default_model")
+            if default_model:
+                return str(default_model)
+        except Exception:
+            pass
+        # Legacy fallback
+        return str(self.config.get("model", "gpt-4o-mini"))
 
 
 def create_agent(config_path: str, workspace_dir: Optional[str] = None) -> AgenticCoder:

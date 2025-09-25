@@ -4,8 +4,8 @@ import uuid
 
 import ray
 
-from agent_llm_openai import OpenAIConductor
-from sandbox_virtualized import SandboxFactory, DeploymentMode
+from agentic_coder_prototype.agent_llm_openai import OpenAIConductor
+from kylecode.sandbox_virtualized import SandboxFactory, DeploymentMode
 from tool_calling.core import ToolDefinition, ToolParameter
 from tool_calling.pythonic02 import Pythonic02Dialect
 from tool_calling.pythonic_inline import PythonicInlineDialect
@@ -145,7 +145,18 @@ def test_dry_run_exec(tmp_path: Path):
             for p in parsed:
                 out = ray.get(agent._exec_raw.remote({"function": p.function, "arguments": p.arguments}))
                 transcript.append({"tool": p.function, "result": out})
-                chunks.append(agent._format_tool_output.__wrapped__(agent, p.function, out, p.arguments) if hasattr(agent._format_tool_output, "__wrapped__") else ray.get(agent._format_tool_output.remote(p.function, out, p.arguments)))
+                # Format the tool output for logging/user relay. Fallback to simple repr if method not present.
+                if hasattr(agent, "_format_tool_output"):
+                    fmt_attr = getattr(agent, "_format_tool_output")
+                    try:
+                        if hasattr(fmt_attr, "__wrapped__"):
+                            chunks.append(fmt_attr.__wrapped__(agent, p.function, out, p.arguments))
+                        else:
+                            chunks.append(ray.get(fmt_attr.remote(p.function, out, p.arguments)))
+                    except Exception:
+                        chunks.append(f"{p.function}: {out}")
+                else:
+                    chunks.append(f"{p.function}: {out}")
 
         # Validate mirror effects in tmp workspace
         assert (tmp_path / "README.md").exists()

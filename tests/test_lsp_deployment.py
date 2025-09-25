@@ -8,14 +8,14 @@ import time
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 
-from lsp_deployment import (
+from kylecode.lsp_deployment import (
     LSPClusterManager,
     LSPDeploymentConfig,
     LSPProxyRouter,
     deploy_lsp_system,
     example_usage
 )
-from lsp_manager_v2 import LSP_SERVER_CONFIGS
+from kylecode.lsp_manager_v2 import LSP_SERVER_CONFIGS
 
 
 @pytest.fixture(scope="module")

@@ -17,10 +17,10 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from pathlib import Path
 
 # Import the modules we'll be testing/modifying
-from agent_llm_openai import OpenAIConductor
+from agentic_coder_prototype.agent_llm_openai import OpenAIConductor
 from tool_calling.composite import CompositeToolCaller
 from tool_calling.system_prompt_compiler import SystemPromptCompiler
-from sandbox_v2 import DevSandboxV2
+from kylecode.sandbox_v2 import DevSandboxV2
 
 
 class TestSequentialBashExecution:

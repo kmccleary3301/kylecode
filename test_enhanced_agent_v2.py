@@ -19,8 +19,15 @@ from tool_calling.enhanced_agent_integration_v2 import EnhancedAgentIntegrationV
 
 
 def load_test_config(config_path: str) -> dict:
-    """Load test configuration from YAML file"""
-    with open(config_path, 'r') as f:
+    """Load test configuration from YAML file.
+    Falls back to agent_configs/ if not found in CWD.
+    """
+    p = Path(config_path)
+    if not p.exists():
+        alt = Path(__file__).parent / 'agent_configs' / p.name
+        if alt.exists():
+            p = alt
+    with open(p, 'r') as f:
         return yaml.safe_load(f)
 
 

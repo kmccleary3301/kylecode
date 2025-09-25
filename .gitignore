@@ -9,6 +9,7 @@ ENV_EXAMPLE.txt
 # Agent workspace directories
 agent_ws_*/
 test_workspace/
+logging/
 
 # Database files
 *.db
@@ -16,6 +17,7 @@ test_workspace/
 *.sqlite3
 
 # Documentation and miscellaneous
+industry_coder_refs/
 misc/
 docs/
 docs_2/
@@ -27,11 +29,11 @@ opencode_docs/
 kylecode_cli_skeleton/
 
 # Cloned repositories and archives
-anon-kode-main/
-anon-kode-main.zip
-claude-code-reverse/
-crush/
-opencode/
+# anon-kode-main/
+# anon-kode-main.zip
+# claude-code-reverse/
+# crush/
+# opencode/
 .claude/
 
 # Debug and research files
@@ -47,7 +49,6 @@ isolated_test_output/
 
 # Experimental files
 firecracker_sandbox/
-sandbox_virtualized.py
 
 # Python
 __pycache__/
@@ -190,3 +191,4 @@ tmp/
 # Session outputs
 session_out.json
 session_out.md
+
