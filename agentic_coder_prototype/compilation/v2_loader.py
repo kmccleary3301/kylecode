@@ -29,6 +29,12 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 
 def _resolve_extends(doc: Dict[str, Any], config_path: Path) -> Dict[str, Any]:
+    """Resolve one or more levels of `extends` declarations.
+
+    Supports single string or list for `extends`, and resolves nested bases
+    recursively so that the final document contains all inherited sections
+    (e.g., `version`, `tools`, `modes`, `loop`).
+    """
     extends_val = doc.get("extends")
     if not extends_val:
         return doc
@@ -41,9 +47,12 @@ def _resolve_extends(doc: Dict[str, Any], config_path: Path) -> Dict[str, Any]:
 
     for rel in paths:
         base_path = (config_path.parent / str(rel)).resolve()
-        base_docs.append(_load_yaml(base_path))
+        base_raw = _load_yaml(base_path)
+        # Recursively resolve base's own extends if present
+        base_resolved = _resolve_extends(base_raw, base_path) if isinstance(base_raw, dict) and base_raw.get("extends") else base_raw
+        base_docs.append(base_resolved)
 
-    merged = {}
+    merged: Dict[str, Any] = {}
     for b in base_docs:
         merged = _deep_merge(merged, b)
     merged = _deep_merge(merged, {k: v for k, v in doc.items() if k != "extends"})
@@ -122,5 +131,4 @@ def load_agent_config(config_path_str: str) -> Dict[str, Any]:
 
     # Fallback: legacy load path, return as-is
     return raw
-
 

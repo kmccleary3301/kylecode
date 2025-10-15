@@ -47,7 +47,26 @@ class AgenticCoder:
             # Fallback to legacy loader for resilience
             with open(self.config_path, 'r') as f:
                 return json.load(f) if self.config_path.endswith('.json') else __import__('yaml').safe_load(f)
-    
+
+    def _resolve_tool_prompt_mode(self) -> Optional[str]:
+        """Resolve desired tool prompt mode from configuration."""
+        cfg = self.config or {}
+        try:
+            prompts_cfg = (cfg.get("prompts") or {})
+            mode = prompts_cfg.get("tool_prompt_mode")
+            if mode:
+                return str(mode)
+        except Exception:
+            pass
+        try:
+            legacy_prompt_cfg = (cfg.get("prompt") or {})
+            mode = legacy_prompt_cfg.get("mode")
+            if mode:
+                return str(mode)
+        except Exception:
+            pass
+        return None
+
     def initialize(self) -> None:
         """Initialize the agent with the loaded configuration."""
         workspace_path = Path(self.workspace_dir)
@@ -60,7 +79,8 @@ class AgenticCoder:
         if not self._local_mode:
             try:
                 if not ray.is_initialized():
-                    ray.init()
+                    # Start an isolated local cluster with a nonstandard dashboard port
+                    ray.init(address="local", include_dashboard=False)
             except Exception:
                 self._local_mode = True
 
@@ -82,9 +102,10 @@ class AgenticCoder:
         """Run a single task and return results."""
         if not self.agent:
             self.initialize()
-        
+
         model = self._select_model()
         steps = int(max_iterations or self.config.get('max_iterations', 12))
+        tool_prompt_mode = self._resolve_tool_prompt_mode() or "system_once"
         # If task is a file path, read it as the user prompt content; else use as-is
         user_prompt = task
         try:
@@ -103,6 +124,7 @@ class AgenticCoder:
                 output_json_path=None,
                 stream_responses=False,
                 output_md_path=None,
+                tool_prompt_mode=tool_prompt_mode,
             )
 
         ref = self.agent.run_agentic_loop.remote(
@@ -113,6 +135,7 @@ class AgenticCoder:
             output_json_path=None,
             stream_responses=False,
             output_md_path=None,
+            tool_prompt_mode=tool_prompt_mode,
         )
         return ray.get(ref)
     
@@ -131,10 +154,23 @@ class AgenticCoder:
                     break
                 
                 model = self._select_model()
+                tool_prompt_mode = self._resolve_tool_prompt_mode() or "system_once"
                 if self._local_mode:
-                    result = self.agent.run_agentic_loop("", user_input, model, max_steps=5)
+                    result = self.agent.run_agentic_loop(
+                        "",
+                        user_input,
+                        model,
+                        max_steps=5,
+                        tool_prompt_mode=tool_prompt_mode,
+                    )
                 else:
-                    ref = self.agent.run_agentic_loop.remote("", user_input, model, max_steps=5)
+                    ref = self.agent.run_agentic_loop.remote(
+                        "",
+                        user_input,
+                        model,
+                        max_steps=5,
+                        tool_prompt_mode=tool_prompt_mode,
+                    )
                     result = ray.get(ref)
                 print(f"Agent completed with status: {result.get('completion_reason', 'unknown')}")
                 

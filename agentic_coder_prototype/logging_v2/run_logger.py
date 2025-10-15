@@ -25,11 +25,12 @@ class LoggerV2Manager:
         self.redact_enabled = bool(((self.config.get("logging") or {}).get("redact") or True))
         self.include_raw = bool(((self.config.get("logging") or {}).get("include_raw") or True))
         self.include_events = bool(((self.config.get("logging") or {}).get("include_events") or True))
+        self.include_structured_requests = bool((log_cfg.get("include_structured_requests", True)))
         self.retention_max_runs = int((log_cfg.get("retention") or {}).get("max_runs", 0) or 0)
         self.run_dir: Optional[Path] = None
 
     def _now_ts(self) -> str:
-        return _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
 
     def _redact(self, data: Any) -> Any:
         if not self.redact_enabled:
@@ -77,6 +78,7 @@ class LoggerV2Manager:
             "artifacts/tool_results",
             "artifacts/diffs",
             "meta",
+            "meta/requests",
         ]:
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
         self.run_dir = run_dir
@@ -139,4 +141,3 @@ class LoggerV2Manager:
 
     def write_meta(self, meta: Dict[str, Any]) -> str:
         return self.write_json("meta/run_meta.json", meta)
-

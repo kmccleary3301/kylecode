@@ -19,7 +19,7 @@ logging/
 # Documentation and miscellaneous
 industry_coder_refs/
 misc/
-docs/
+# docs/
 docs_2/
 examples/
 terminal_ui_packages/

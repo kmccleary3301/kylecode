@@ -13,6 +13,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from .provider_capabilities import CAPABILITY_MATRIX, ProviderCapabilities
 
 @dataclass
 class ProviderDescriptor:
@@ -162,7 +163,9 @@ class ProviderRouter:
                 api_key_env="OPENROUTER_API_KEY",
                 default_headers={
                     "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", ""),
-                    "X-Title": os.getenv("OPENROUTER_APP_TITLE", "Ray SCE Agent")
+                    "X-Title": os.getenv("OPENROUTER_APP_TITLE", "Ray SCE Agent"),
+                    "Accept": "application/json; charset=utf-8",
+                    "Accept-Encoding": "identity",
                 },
                 runtime_id="openrouter_chat",
                 default_api_variant="chat",
@@ -180,12 +183,23 @@ class ProviderRouter:
                 supports_streaming=True,
                 supports_reasoning_traces=True,
                 supports_cache_control=True,
+            ),
+            "mock": ProviderConfig(
+                provider_id="mock",
+                supports_native_tools=False,
+                tool_schema_format="openai",
+                api_key_env="MOCK_API_KEY",
+                runtime_id="mock_chat",
+                default_api_variant="mock",
+                supports_streaming=False,
+                supports_reasoning_traces=False,
+                supports_cache_control=False,
             )
         }
         
         self.translators = {
             "openai": OpenAIToolTranslator(),
-            "anthropic": AnthropicToolTranslator()
+            "anthropic": AnthropicToolTranslator(),
         }
     
     def parse_model_id(self, model_id: str) -> Tuple[str, str, str]:
@@ -275,14 +289,22 @@ class ProviderRouter:
         
         # Default: use native tools if supported
         return supports_native
-    
+
+    def get_capabilities(self, model_id: str) -> ProviderCapabilities:
+        provider, _, _ = self.parse_model_id(model_id)
+        return CAPABILITY_MATRIX.get(provider, CAPABILITY_MATRIX["openai"])
+
     def create_client_config(self, model_id: str) -> Dict[str, Any]:
         """Create client configuration for the given model"""
         config, actual_model, _ = self.get_provider_config(model_id)
         
+        api_key = os.getenv(config.api_key_env)
+        if config.provider_id == "mock":
+            api_key = api_key or "mock"
+
         client_config = {
             "model": actual_model,
-            "api_key": os.getenv(config.api_key_env),
+            "api_key": api_key,
         }
         
         if config.base_url:

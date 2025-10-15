@@ -8,9 +8,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Dict, Any, Optional, List, Callable
+import shlex
+import re
 from pathlib import Path
 
 from ..utils.workspace_tracker import WorkspaceStateTracker
+from kylecode.opencode_patch import PatchParseError, parse_opencode_patch, to_unified_diff
 from .sequence_validator import SequenceValidator
 
 logger = logging.getLogger(__name__)
@@ -42,7 +45,12 @@ class EnhancedToolExecutor:
         self.yaml_tool_manipulations: Dict[str, List[str]] = self.config.get("yaml_tool_manipulations", {})
         
         # Initialize workspace tracker
-        workspace_root = self.config.get("workspace", ".")
+        # Accept v2 shape where `workspace` is a dict with `root`; fall back to '.'
+        raw_ws = self.config.get("workspace", ".")
+        if isinstance(raw_ws, dict):
+            workspace_root = raw_ws.get("root", ".")
+        else:
+            workspace_root = raw_ws
         self.workspace_tracker = WorkspaceStateTracker(workspace_root)
         
         # Initialize sequence validator (without LSP rule - handled by LSPEnhancedSandbox)
@@ -228,6 +236,21 @@ class EnhancedToolExecutor:
                     "suggested_alternative": self._suggest_alternative(tool_call, validation_error)
                 }
         
+        # Preflight rule: guard premature `make` invocations until Makefile is ready
+        try:
+            if function == "run_shell":
+                cmd_raw = str(tool_call.get("arguments", {}).get("command", "")).strip()
+                preflight_error = self._preflight_check_make(cmd_raw)
+                if preflight_error:
+                    return {
+                        "error": preflight_error,
+                        "validation_failure": True,
+                        "hint": "Ensure a Makefile exists defining targets: all, test, clean before running make"
+                    }
+        except Exception:
+            # Preflight should never crash execution path; ignore failures
+            pass
+
         # 3. Execute the tool call (with create_file_policy adjustments)
         try:
             # Normalize path arguments before execution
@@ -301,12 +324,83 @@ class EnhancedToolExecutor:
             }
         
         return result
+
+    def _preflight_check_make(self, command: str) -> Optional[str]:
+        """Deny `make*` commands until a Makefile with all/test/clean exists.
+
+        Lightweight content sniffing; workspace root is implicit for sandbox calls.
+        """
+        if not command:
+            return None
+        try:
+            tokens = shlex.split(command)
+        except Exception:
+            # If we cannot parse reliably, skip preflight
+            return None
+
+        if not tokens:
+            return None
+        exe = tokens[0]
+        base = exe.rsplit("/", 1)[-1].lower()
+        if base not in {"make", "gmake"}:
+            return None
+
+        # Check Makefile presence at workspace root
+        try:
+            has_mk = False
+            for name in ("Makefile", "makefile", "GNUmakefile"):
+                try:
+                    if self.sandbox.exists(name):  # type: ignore[attr-defined]
+                        has_mk = True
+                        mk_name = name
+                        break
+                except Exception:
+                    continue
+            if not has_mk:
+                return "Makefile not found in workspace; create it before running 'make'"
+
+            # Read and check for required targets
+            content = ""
+            try:
+                res = self.sandbox.read_text(mk_name)  # type: ignore[attr-defined]
+                if isinstance(res, dict) and "content" in res:
+                    content = str(res.get("content", ""))
+                elif isinstance(res, str):
+                    content = res
+            except Exception:
+                # If read fails, allow execution rather than hard-block
+                return None
+
+            missing = []
+            for target in ("all", "test", "clean"):
+                pat = re.compile(rf"^\s*{re.escape(target)}\s*:\s*", re.MULTILINE)
+                if not pat.search(content):
+                    missing.append(target)
+            if missing:
+                return f"Makefile missing required target(s): {', '.join(missing)}"
+        except Exception:
+            # Be permissive on unexpected errors
+            return None
+
+        return None
     
     async def _execute_raw_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """Execute tool call using sandbox (fallback implementation)"""
         function = tool_call.get("function", "")
         arguments = tool_call.get("arguments", {})
-        
+
+        if function == "patch" and isinstance(arguments.get("patchText"), str):
+            try:
+                unified = self._convert_opencode_patch(arguments["patchText"])
+            except PatchParseError as exc:
+                return {"error": f"Invalid OpenCode patch: {exc}", "validation_failure": True}
+            arguments = dict(arguments)
+            arguments.pop("patchText", None)
+            arguments["patch"] = unified
+            tool_call = dict(tool_call)
+            tool_call["function"] = function = "apply_unified_patch"
+            tool_call["arguments"] = arguments
+
         # Map function names to sandbox methods (base)
         method_map = {
             # Legacy/internal
@@ -316,7 +410,6 @@ class EnhancedToolExecutor:
             "list_dir": "list_dir",
             "apply_unified_patch": "apply_patch",
             "apply_search_replace": "apply_search_replace",
-            "create_file_from_block": "create_file_from_block",
             "write_text": "write_text",
             "read_text": "read_text",
             "multiedit": "multiedit",
@@ -451,25 +544,36 @@ class EnhancedToolExecutor:
                 files.append(args[key])
         
         # Extract from patches
-        if function == "apply_unified_patch" and "patch" in args:
-            patch_files = self._extract_files_from_patch(args["patch"])
+        if function == "patch" and "patchText" in args:
+            patch_files = self._extract_files_from_patch(args["patchText"])
             files.extend(patch_files)
         
         return list(set(files))  # Remove duplicates
     
     def _extract_files_from_patch(self, patch_content: str) -> List[str]:
-        """Extract file paths from patch content"""
-        files = []
-        for line in patch_content.split('\n'):
-            if line.startswith('--- ') or line.startswith('+++ '):
-                parts = line.split('\t')[0].split(' ', 1)
-                if len(parts) > 1:
-                    file_path = parts[1]
-                    if file_path.startswith(('a/', 'b/')):
-                        file_path = file_path[2:]
-                    if file_path != '/dev/null':
-                        files.append(file_path)
-        return files
+        """Extract file paths from OpenCode patch content"""
+        try:
+            operations = parse_opencode_patch(patch_content)
+        except PatchParseError:
+            return []
+        return list({op.file_path for op in operations})
+
+    def _fetch_file_content_for_patch(self, path: str) -> str:
+        try:
+            result = self.sandbox.read_text(path)
+        except PatchParseError:
+            raise
+        except Exception as exc:
+            raise PatchParseError(f"Failed to read {path}: {exc}") from exc
+
+        if isinstance(result, dict) and "content" in result:
+            return result["content"]
+        if isinstance(result, str):
+            return result
+        raise PatchParseError(f"Unexpected sandbox read result for {path}")
+
+    def _convert_opencode_patch(self, patch_text: str) -> str:
+        return to_unified_diff(patch_text, self._fetch_file_content_for_patch)
     
     def _suggest_alternative(self, tool_call: Dict[str, Any], validation_error: str) -> Optional[Dict[str, Any]]:
         """Suggest alternative tool call based on validation error"""
@@ -478,14 +582,21 @@ class EnhancedToolExecutor:
         
         # Suggest edit tools instead of create for existing files
         if "already created" in validation_error or "already exists" in validation_error:
-            if function in ["create_file", "create_file_from_block"]:
+            if function == "create_file":
                 return {
-                    "suggested_function": "apply_unified_patch",
+                    "suggested_function": "patch",
                     "reason": "File exists, use patch/edit instead of creation",
                     "example_usage": {
-                        "function": "apply_unified_patch",
+                        "function": "patch",
                         "arguments": {
-                            "patch": f"--- a/{args.get('path', 'filename')}\n+++ b/{args.get('path', 'filename')}\n@@ -1,1 +1,1 @@\n-existing_content\n+new_content"
+                            "patchText": (
+                                "*** Begin Patch\n"
+                                f"*** Update File: {args.get('path', 'filename')}\n"
+                                "@@ context\n"
+                                "-old_line\n"
+                                "+new_line\n"
+                                "*** End Patch"
+                            )
                         }
                     }
                 }
@@ -569,7 +680,7 @@ class EnhancedToolExecutor:
             return None
 
         # File write permissions (create/edit)
-        if function in ["create_file", "create_file_from_block", "apply_unified_patch", "apply_search_replace", "write_text", "multiedit", "edit_replace"]:
+        if function in ["create_file", "patch", "apply_unified_patch", "apply_search_replace", "write_text", "multiedit", "edit_replace"]:
             write_cfg = permissions_cfg.get("file_write", {})
             if not write_cfg:
                 return None

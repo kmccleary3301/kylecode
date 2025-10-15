@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass, field
+import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Type
+import textwrap
 
 try:  # pragma: no cover - import guard exercised in runtime
     from openai import OpenAI
@@ -166,25 +169,513 @@ class OpenAIBaseRuntime(ProviderRuntime):
         except Exception:
             return ""
 
+    def _decode_body_text(self, raw: Any) -> Optional[str]:
+        """Best-effort decode of raw HTTP body for diagnostics."""
+
+        try:
+            payload = getattr(raw, "content", None)
+        except Exception:
+            payload = None
+        if payload is None:
+            return None
+
+        try:
+            if isinstance(payload, str):
+                return payload
+            if isinstance(payload, (bytes, bytearray)):
+                data = bytes(payload)
+                headers = getattr(raw, "headers", {}) or {}
+                encoding = None
+                if isinstance(headers, dict):
+                    encoding = headers.get("Content-Encoding") or headers.get("content-encoding")
+                if encoding and "gzip" in str(encoding).lower():
+                    try:
+                        import gzip
+
+                        return gzip.decompress(data).decode("utf-8", "ignore")
+                    except Exception:
+                        return data.decode("utf-8", "ignore")
+                return data.decode("utf-8", "ignore")
+            return str(payload)
+        except Exception:
+            return None
+
+    def _encode_body_base64(self, raw: Any, limit: int = 65536) -> Optional[str]:
+        """Return base64-encoded body content (up to `limit`) for diagnostics."""
+
+        try:
+            payload = getattr(raw, "content", None)
+        except Exception:
+            payload = None
+        if payload is None:
+            return None
+
+        data: Optional[bytes]
+        try:
+            if isinstance(payload, (bytes, bytearray)):
+                data = bytes(payload)
+            elif isinstance(payload, str):
+                data = payload.encode("utf-8", "ignore")
+            else:
+                data = None
+        except Exception:
+            data = None
+
+        if not data:
+            return None
+
+        if limit and limit > 0:
+            data = data[:limit]
+
+        try:
+            return base64.b64encode(data).decode("ascii")
+        except Exception:
+            return None
+
+    def _split_sse_events(self, body_text: str) -> List[str]:
+        """Split an SSE body into individual `data:` payload strings."""
+
+        events: List[str] = []
+        buffer: List[str] = []
+        for line in body_text.splitlines():
+            if not line.strip():
+                if buffer:
+                    events.append("\n".join(buffer))
+                    buffer = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                buffer.append(line[5:].lstrip())
+            else:
+                buffer.append(line.strip())
+        if buffer:
+            events.append("\n".join(buffer))
+        return events
+
+    def _aggregate_sse_events(self, payloads: List[str]) -> Optional[Dict[str, Any]]:
+        """Aggregate SSE chat completion payloads into a final response dictionary."""
+
+        if not payloads:
+            return None
+
+        choices_state: Dict[int, Dict[str, Any]] = {}
+        response_id: Optional[str] = None
+        model_name: Optional[str] = None
+        usage_block: Optional[Dict[str, Any]] = None
+
+        for payload in payloads:
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event_obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+
+            response_id = event_obj.get("id") or response_id
+            model_name = event_obj.get("model") or model_name
+            candidate_usage = event_obj.get("usage")
+            if candidate_usage and not usage_block:
+                usage_block = candidate_usage
+
+            for choice in event_obj.get("choices", []) or []:
+                idx = choice.get("index", 0)
+                state = choices_state.setdefault(
+                    idx,
+                    {
+                        "role": None,
+                        "content": [],
+                        "tool_calls": {},
+                        "finish_reason": None,
+                    },
+                )
+
+                finish_reason = choice.get("finish_reason")
+                if finish_reason:
+                    state["finish_reason"] = finish_reason
+
+                message_obj = choice.get("message") or {}
+                if message_obj:
+                    role_val = message_obj.get("role")
+                    if role_val:
+                        state["role"] = role_val
+                    content_val = message_obj.get("content")
+                    if isinstance(content_val, str):
+                        state["content"].append(content_val)
+                    elif isinstance(content_val, list):
+                        for block in content_val:
+                            text_val = self._get_attr(block, "text")
+                            if text_val:
+                                state["content"].append(str(text_val))
+                    tool_calls_list = message_obj.get("tool_calls") or []
+                    if tool_calls_list:
+                        tool_map: Dict[int, Dict[str, Any]] = {}
+                        for tc_idx, tc in enumerate(tool_calls_list):
+                            fn_payload = dict(self._get_attr(tc, "function", {}) or {})
+                            if "arguments" not in fn_payload:
+                                fn_payload["arguments"] = fn_payload.get("arguments", "")
+                            tool_map[tc_idx] = {
+                                "id": self._get_attr(tc, "id"),
+                                "type": self._get_attr(tc, "type", "function"),
+                                "function": fn_payload,
+                            }
+                        state["tool_calls"] = tool_map
+
+                delta_obj = choice.get("delta") or {}
+                delta_role = delta_obj.get("role")
+                if delta_role:
+                    state["role"] = delta_role
+                delta_content = delta_obj.get("content")
+                if isinstance(delta_content, str):
+                    state["content"].append(delta_content)
+                elif isinstance(delta_content, list):
+                    for block in delta_content:
+                        text_val = self._get_attr(block, "text")
+                        if text_val:
+                            state["content"].append(str(text_val))
+                for tc in delta_obj.get("tool_calls", []) or []:
+                    tc_index = tc.get("index")
+                    if tc_index is None:
+                        tc_index = len(state["tool_calls"])
+                    call_state = state["tool_calls"].setdefault(
+                        tc_index,
+                        {
+                            "id": None,
+                            "type": "function",
+                            "function": {"name": None, "arguments": ""},
+                        },
+                    )
+                    if tc.get("id"):
+                        call_state["id"] = tc["id"]
+                    if tc.get("type"):
+                        call_state["type"] = tc["type"]
+                    fn_delta = tc.get("function") or {}
+                    if fn_delta.get("name"):
+                        call_state["function"]["name"] = fn_delta["name"]
+                    if fn_delta.get("arguments"):
+                        existing = call_state["function"].get("arguments") or ""
+                        call_state["function"]["arguments"] = existing + fn_delta["arguments"]
+
+        if not choices_state:
+            return None
+
+        assembled_choices: List[Dict[str, Any]] = []
+        for idx in sorted(choices_state.keys()):
+            state = choices_state[idx]
+            content_str = "".join(state["content"]).strip() if state["content"] else None
+            tool_calls_map = state["tool_calls"]
+            tool_calls_list: List[Dict[str, Any]] = []
+            if isinstance(tool_calls_map, dict) and tool_calls_map:
+                for tc_idx in sorted(tool_calls_map.keys()):
+                    entry = tool_calls_map[tc_idx]
+                    fn_payload = dict(entry.get("function") or {})
+                    if "arguments" not in fn_payload:
+                        fn_payload["arguments"] = ""
+                    tool_calls_list.append(
+                        {
+                            "id": entry.get("id"),
+                            "type": entry.get("type", "function"),
+                            "function": fn_payload,
+                        }
+                    )
+
+            message_payload: Dict[str, Any] = {}
+            role_val = state.get("role")
+            if role_val or content_str or tool_calls_list:
+                message_payload["role"] = role_val or "assistant"
+            if content_str:
+                message_payload["content"] = content_str
+            elif tool_calls_list:
+                message_payload["content"] = None
+            if tool_calls_list:
+                message_payload["tool_calls"] = tool_calls_list
+
+            assembled_choices.append(
+                {
+                    "index": idx,
+                    "message": message_payload,
+                    "finish_reason": state.get("finish_reason"),
+                }
+            )
+
+        response_payload: Dict[str, Any] = {
+            "choices": assembled_choices,
+        }
+        if response_id:
+            response_payload["id"] = response_id
+        if model_name:
+            response_payload["model"] = model_name
+        if usage_block:
+            response_payload["usage"] = usage_block
+        return response_payload
+
+    def _parse_sse_chat_completion(self, raw: Any, model: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Parse a text/event-stream payload into a chat completion style result."""
+
+        body_text = self._decode_body_text(raw)
+        if not body_text:
+            return None
+        events = self._split_sse_events(body_text)
+        response_payload = self._aggregate_sse_events(events)
+        if response_payload is None:
+            return None
+        if model and "model" not in response_payload:
+            response_payload["model"] = model
+        return SimpleNamespace(**response_payload)
+
+    def _normalize_headers(self, headers: Any) -> Dict[str, str]:
+        """Return a case-insensitive copy of response headers for diagnostics."""
+
+        normalized: Dict[str, str] = {}
+        if headers is None:
+            return normalized
+        try:
+            items = headers.items() if hasattr(headers, "items") else headers
+            for key, value in items:
+                if key is None or value is None:
+                    continue
+                normalized[str(key).lower()] = str(value)
+        except Exception:
+            pass
+        return normalized
+
+    def _normalize_content_type(self, content_type: Optional[str]) -> Optional[str]:
+        """Return the base MIME type without parameters."""
+
+        if not content_type:
+            return None
+        base = content_type.split(";", 1)[0].strip().lower()
+        return base or None
+
+    def _is_json_content_type(self, content_type: Optional[str]) -> bool:
+        """Identify content types that should be parsed as JSON."""
+
+        normalized = self._normalize_content_type(content_type)
+        if normalized is None:
+            return False
+        return normalized in {"application/json", "application/problem+json"}
+
+    def _extract_request_id(self, headers: Dict[str, str]) -> Optional[str]:
+        """Extract a provider request identifier from response headers if present."""
+
+        for key in ("openrouter-request-id", "x-request-id", "request-id"):
+            if key in headers:
+                return headers[key]
+        return None
+
+    def _classify_html_response(self, snippet: str) -> Optional[Dict[str, str]]:
+        """Identify common HTML payloads so callers can surface better hints."""
+
+        lowered = (snippet or "").lower()
+        if not lowered:
+            return None
+
+        if "rate limit" in lowered or "too many requests" in lowered:
+            return {
+                "classification": "rate_limited",
+                "hint": "Provider rate-limited the request; pause briefly or slow retries.",
+            }
+        if "cloudflare" in lowered or "cf-ray" in lowered:
+            return {
+                "classification": "gateway_protection",
+                "hint": "Provider gateway (Cloudflare) blocked the call; check upstream status.",
+            }
+        if "maintenance" in lowered:
+            return {
+                "classification": "maintenance",
+                "hint": "Provider reported maintenance; retry later.",
+            }
+        return None
+
     def _call_with_raw_response(self, collection: Any, *, error_context: str, **kwargs):
+        """Call provider with raw response handling and short HTML retry.
+
+        Some providers intermittently return HTML error pages. Detect these by
+        attempting to parse and, on JSON decode failure with an HTML body
+        snippet, retry a small number of times with brief backoff.
+        """
         raw_callable = getattr(collection, "with_raw_response", None)
         if raw_callable is None:
             return collection.create(**kwargs)
-        raw = raw_callable.create(**kwargs)
-        try:
-            return raw.parse()
-        except json.JSONDecodeError as exc:
-            snippet = self._decode_snippet(getattr(raw, "content", None))
-            status_code = getattr(raw, "status_code", None)
-            details = {
-                "body_snippet": snippet,
-                "status_code": status_code,
-                "context": error_context,
+
+        if self.descriptor.provider_id == "openrouter":
+            forced_headers = {
+                "Accept": "application/json; charset=utf-8",
+                "Accept-Encoding": "identity",
             }
-            raise ProviderRuntimeError(
-                "Failed to decode provider response (non-JSON payload). This often indicates an HTML error page from the provider.",
-                details=details,
-            ) from exc
+            extra_headers = dict(kwargs.get("extra_headers") or {})
+            existing_lower = {key.lower(): key for key in extra_headers}
+            for header, value in forced_headers.items():
+                if header.lower() not in existing_lower:
+                    extra_headers[header] = value
+            if extra_headers:
+                kwargs["extra_headers"] = extra_headers
+
+        # Small, bounded retry plan per V11 next steps
+        max_retries = 2
+        backoffs = [0.4, 0.9]
+        retry_schedule: List[float] = []
+
+        last_exc: Optional[Exception] = None
+        last_details: Dict[str, Any] = {}
+        captured_html: Optional[str] = None
+        for attempt in range(max_retries + 1):
+            raw = raw_callable.create(**kwargs)
+            response_headers = self._normalize_headers(getattr(raw, "headers", {}) or {})
+            content_type_header = response_headers.get("content-type")
+            normalized_content_type = self._normalize_content_type(content_type_header)
+            status_code = getattr(raw, "status_code", None)
+
+            if (
+                self.descriptor.provider_id == "openrouter"
+                and normalized_content_type
+                and not self._is_json_content_type(content_type_header)
+            ):
+                snippet = self._decode_snippet(getattr(raw, "content", None))
+                full_body_text = self._decode_body_text(raw)
+                details: Dict[str, Any] = {
+                    "body_snippet": snippet,
+                    "status_code": status_code,
+                    "context": error_context,
+                    "attempt": attempt,
+                    "content_type": content_type_header,
+                    "response_headers": response_headers or None,
+                }
+                request_id = self._extract_request_id(response_headers)
+                if request_id:
+                    details["request_id"] = request_id
+                if full_body_text:
+                    details["raw_excerpt"] = full_body_text[:2000]
+                body_b64 = self._encode_body_base64(raw)
+                if body_b64:
+                    details["raw_body_b64"] = body_b64
+
+                if normalized_content_type == "text/html":
+                    details["html_detected"] = True
+                    classification = self._classify_html_response(snippet)
+                    if classification:
+                        details.update(classification)
+                    if captured_html is None:
+                        captured_html = snippet or (full_body_text[:4000] if full_body_text else None)
+                    if attempt < max_retries:
+                        try:
+                            wait_time = backoffs[attempt] if attempt < len(backoffs) else 0.8
+                            retry_schedule.append(wait_time)
+                            time.sleep(wait_time)
+                        except Exception:
+                            pass
+                        continue
+                    details["attempts"] = attempt + 1
+                    if retry_schedule:
+                        details["retry_schedule"] = retry_schedule
+                    if captured_html:
+                        details.setdefault("html_excerpt", captured_html[:2000])
+                    raise ProviderRuntimeError(
+                        "Failed to decode provider response (non-JSON payload). This often indicates an HTML error page from the provider.",
+                        details=details,
+                    )
+
+                if normalized_content_type == "text/event-stream":
+                    details["classification"] = "event_stream"
+                    parsed = self._parse_sse_chat_completion(raw, kwargs.get("model"))
+                    if parsed is not None:
+                        return parsed
+                    details["classification"] = "event_stream_parse_failed"
+                    details["sse_parse_failed"] = True
+                    raise ProviderRuntimeError(
+                        "Unable to parse text/event-stream payload from provider.",
+                        details=details,
+                    )
+
+                details["classification"] = "unexpected_content_type"
+                raise ProviderRuntimeError("Unexpected Content-Type received from provider.", details=details)
+
+            try:
+                return raw.parse()
+            except json.JSONDecodeError as exc:
+                last_exc = exc
+                snippet = self._decode_snippet(getattr(raw, "content", None))
+                # Detect likely HTML payloads
+                is_html = "<html" in (snippet or "").lower() or "<!doctype html" in (snippet or "").lower()
+                full_body_text = self._decode_body_text(raw)
+                last_details = {
+                    "body_snippet": snippet,
+                    "status_code": status_code,
+                    "context": error_context,
+                    "attempt": attempt,
+                    "html_detected": bool(is_html),
+                    "content_type": content_type_header,
+                    "response_headers": response_headers or None,
+                }
+                request_id = self._extract_request_id(response_headers)
+                if request_id:
+                    last_details["request_id"] = request_id
+                if full_body_text:
+                    last_details.setdefault("raw_excerpt", full_body_text[:2000])
+                body_b64 = self._encode_body_base64(raw)
+                if body_b64:
+                    last_details.setdefault("raw_body_b64", body_b64)
+                if is_html:
+                    classification = self._classify_html_response(snippet)
+                    if classification:
+                        last_details.update(classification)
+                    if captured_html is None:
+                        captured_html = snippet
+                        if not captured_html:
+                            if full_body_text:
+                                captured_html = full_body_text[:4000]
+                if is_html and attempt < max_retries:
+                    # Short backoff then retry
+                    try:
+                        wait_time = backoffs[attempt] if attempt < len(backoffs) else 0.8
+                        retry_schedule.append(wait_time)
+                        time.sleep(wait_time)
+                    except Exception:
+                        pass
+                    continue
+
+                details = dict(last_details)
+                details["attempts"] = attempt + 1
+                if retry_schedule:
+                    details["retry_schedule"] = retry_schedule
+                details["retry_outcome"] = "retry_exhausted_html" if details.get("html_detected") else "retry_exhausted_non_json"
+                if captured_html:
+                    details.setdefault("body_snippet", captured_html)
+                    details.setdefault("html_excerpt", captured_html[:2000])
+                elif full_body_text:
+                    details.setdefault("body_snippet", full_body_text[:400])
+                    details.setdefault("raw_excerpt", full_body_text[:2000])
+                raise ProviderRuntimeError(
+                    "Failed to decode provider response (non-JSON payload). This often indicates an HTML error page from the provider.",
+                    details=details,
+                ) from exc
+            except Exception as exc:
+                # Non-JSON errors: do not retry unless they look like transient HTML (covered above)
+                last_exc = exc
+                break
+
+        # Safety: if we fall out of loop, raise a normalized runtime error
+        error_msg = str(last_exc) if last_exc else "Unknown provider error"
+        if last_details:
+            if retry_schedule:
+                last_details.setdefault("retry_schedule", retry_schedule)
+            last_details.setdefault(
+                "retry_outcome",
+                "retry_exhausted_html" if last_details.get("html_detected") else "retry_exhausted_non_json",
+            )
+            if captured_html and not last_details.get("body_snippet"):
+                last_details["body_snippet"] = captured_html
+                last_details.setdefault("html_excerpt", captured_html[:2000])
+            if "raw_excerpt" not in last_details:
+                full_body_text = self._decode_body_text(raw)
+                if full_body_text:
+                    last_details["raw_excerpt"] = full_body_text[:2000]
+            if "raw_body_b64" not in last_details:
+                body_b64 = self._encode_body_base64(raw)
+                if body_b64:
+                    last_details["raw_body_b64"] = body_b64
+            raise ProviderRuntimeError(error_msg, details=last_details)
+        raise ProviderRuntimeError(error_msg)
 
     # --- data conversion helpers -----------------------------------------
     def _convert_messages_to_chat(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -798,6 +1289,137 @@ class AnthropicMessagesRuntime(ProviderRuntime):
 provider_registry.register_runtime("anthropic_messages", AnthropicMessagesRuntime)
 
 
+# ---------------------------------------------------------------------------
+# Mock runtime (offline validation)
+# ---------------------------------------------------------------------------
+
+
+class MockRuntime(ProviderRuntime):
+    """A simple mock provider runtime for offline validation.
+
+    Heuristics:
+      - If no prior tool calls, request list_dir(path=".", depth=1)
+      - Else if only one prior tool call, request apply_unified_patch with a minimal project skeleton
+      - Else, return a short assistant message
+    """
+
+    def create_client(
+        self,
+        api_key: str,
+        *,
+        base_url: Optional[str] = None,
+        default_headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        return {"mock": True}
+
+    def invoke(
+        self,
+        *,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        stream: bool,
+        context: ProviderRuntimeContext,
+    ) -> ProviderResult:
+        # Count prior tool calls in assistant messages
+        prior_calls = 0
+        for msg in messages:
+            if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
+                prior_calls += len(msg.get("tool_calls") or [])
+
+        def _mk_tool_call(name: str, args: Dict[str, Any]) -> ProviderToolCall:
+            try:
+                arg_str = json.dumps(args)
+            except Exception:
+                arg_str = "{}"
+            ptc = ProviderToolCall(id=None, name=name, arguments=arg_str, type="function")
+            try:
+                from types import SimpleNamespace as _SNS
+                setattr(ptc, "function", _SNS(name=name, arguments=arg_str))
+            except Exception:
+                pass
+            return ptc
+
+        out_messages: List[ProviderMessage] = []
+
+        if prior_calls == 0:
+            # Explore workspace
+            tc = _mk_tool_call("list_dir", {"path": ".", "depth": 1})
+            out_messages.append(ProviderMessage(role="assistant", content=None, tool_calls=[tc], finish_reason="stop", index=0))
+        elif prior_calls == 1:
+            # Emit a minimal unified diff patch adding Makefile and skeleton files
+            unified = textwrap.dedent(
+                """
+                diff --git a/Makefile b/Makefile
+                new file mode 100644
+                index 0000000..c3f9c3b
+                --- /dev/null
+                +++ b/Makefile
+                @@ -0,0 +1,7 @@
+                +CC=gcc
+                +CFLAGS=-Wall -Wextra -Werror
+                +all: test
+                +test: protofilesystem.o test_filesystem.o
+                +\t$(CC) $(CFLAGS) -o test_fs protofilesystem.o test_filesystem.o
+                +clean:
+                +\trm -f *.o test_fs
+
+                diff --git a/protofilesystem.h b/protofilesystem.h
+                new file mode 100644
+                index 0000000..1f1264a
+                --- /dev/null
+                +++ b/protofilesystem.h
+                @@ -0,0 +1,6 @@
+                +#ifndef PROTOFILESYSTEM_H
+                +#define PROTOFILESYSTEM_H
+                +
+                +int fs_init(void);
+                +
+                +#endif
+
+                diff --git a/protofilesystem.c b/protofilesystem.c
+                new file mode 100644
+                index 0000000..4d6c0be
+                --- /dev/null
+                +++ b/protofilesystem.c
+                @@ -0,0 +1,5 @@
+                +#include \"protofilesystem.h\"
+                +
+                +int fs_init(void) {
+                +    return 0;
+                +}
+
+                diff --git a/test_filesystem.c b/test_filesystem.c
+                new file mode 100644
+                index 0000000..a3bb0bc
+                --- /dev/null
+                +++ b/test_filesystem.c
+                @@ -0,0 +1,11 @@
+                +#include <stdio.h>
+                +#include \"protofilesystem.h\"
+                +
+                +int main(void) {
+                +    if (fs_init() != 0) {
+                +        fprintf(stderr, \"fs_init failed\\n\");
+                +        return 1;
+                +    }
+                +    printf(\"OK\\n\");
+                +    return 0;
+                +}
+                """
+            ).lstrip("\n")
+            if not unified.endswith("\n"):
+                unified += "\n"
+            tc = _mk_tool_call("apply_unified_patch", {"patch": unified})
+            out_messages.append(ProviderMessage(role="assistant", content=None, tool_calls=[tc], finish_reason="stop", index=0))
+        else:
+            out_messages.append(ProviderMessage(role="assistant", content="Proceed to build and test.", tool_calls=[], finish_reason="stop", index=0))
+
+        return ProviderResult(messages=out_messages, raw_response={"mock": True}, usage=None, encrypted_reasoning=None, reasoning_summaries=None, model="mock")
+
+
+provider_registry.register_runtime("mock_chat", MockRuntime)
 __all__ = [
     "ProviderRuntime",
     "ProviderRuntimeContext",
@@ -810,4 +1432,5 @@ __all__ = [
     "OpenAIChatRuntime",
     "OpenAIResponsesRuntime",
     "AnthropicMessagesRuntime",
+    "MockRuntime",
 ]

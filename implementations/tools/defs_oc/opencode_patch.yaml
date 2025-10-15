@@ -1,6 +1,6 @@
 id: patch
 name: patch
-description: Apply an OpenCode-style patch block (*** Begin Patch / *** Add File / *** End Patch)
+description: Apply an OpenCode patch block (*** Begin Patch / *** Update|Add|Delete File / *** End Patch)
 type_id: diff
 manipulations:
   - diff.apply
@@ -17,6 +17,5 @@ provider_routing:
   openai:
     native_primary: false
     fallback_formats: [opencode_patch]
-
 
 

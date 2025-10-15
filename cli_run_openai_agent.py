@@ -59,7 +59,8 @@ def main():
     out_md_path = (project_root / out_md).resolve() if out_md and not Path(out_md).is_absolute() else (Path(out_md) if out_md else None)
 
     model_id = cfg.get("model", {}).get("id", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-    tool_prompt_mode = cfg.get("prompt", {}).get("mode", "system_once")
+    prompts_cfg = cfg.get("prompts", {}) or {}
+    tool_prompt_mode = prompts_cfg.get("tool_prompt_mode") or cfg.get("prompt", {}).get("mode", "system_once")
     completion_sentinel = cfg.get("prompt", {}).get("completion_sentinel", ">>>>>> END RESPONSE")
 
     system_path = cfg.get("prompt", {}).get("system")
@@ -204,5 +205,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

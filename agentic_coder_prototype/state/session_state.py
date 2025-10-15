@@ -6,7 +6,15 @@ from typing import Any, Dict, List, Optional
 from pathlib import Path
 import json
 
+from dataclasses import asdict
+
 from ..reasoning_trace_store import ReasoningTraceStore
+from ..provider_ir import (
+    IRConversation,
+    IRDeltaEvent,
+    IRFinish,
+    convert_legacy_messages,
+)
 
 
 class SessionState:
@@ -26,6 +34,8 @@ class SessionState:
         self.completion_summary: Dict[str, Any] = {}
         self.provider_metadata: Dict[str, Any] = {}
         self.reasoning_traces = ReasoningTraceStore()
+        self.ir_events: List[IRDeltaEvent] = []
+        self.ir_finish: Optional[IRFinish] = None
     
     def add_message(self, message: Dict[str, Any], to_provider: bool = True):
         """Add a message to the session state"""
@@ -46,6 +56,23 @@ class SessionState:
 
     def clear_provider_metadata(self) -> None:
         self.provider_metadata.clear()
+
+    # --- IR helpers ---------------------------------------------------------
+    def add_ir_event(self, event: IRDeltaEvent) -> None:
+        self.ir_events.append(event)
+
+    def set_ir_finish(self, finish: IRFinish) -> None:
+        self.ir_finish = finish
+
+    def build_conversation_ir(self, conversation_id: str, ir_version: str = "1") -> IRConversation:
+        messages_ir = convert_legacy_messages(self.messages)
+        return IRConversation(
+            id=conversation_id,
+            ir_version=ir_version,
+            messages=messages_ir,
+            events=list(self.ir_events),
+            finish=self.ir_finish,
+        )
 
     def get_debug_info(self) -> Dict[str, Any]:
         """Get enhanced debugging information about tool usage and provider configuration"""
@@ -91,6 +118,8 @@ class SessionState:
                 "encrypted": len(self.reasoning_traces.get_encrypted_traces()),
                 "summaries": len(self.reasoning_traces.get_summaries()),
             },
+            "ir_version": "1",
+            "conversation_ir": asdict(self.build_conversation_ir(conversation_id="snapshot")),
         }
         return snapshot
     

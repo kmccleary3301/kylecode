@@ -77,29 +77,10 @@ def _tool_defs():
         ),
         ToolDefinition(
             type_id="diff",
-            name="apply_search_replace",
-            description="Aider-style SEARCH/REPLACE.",
-            parameters=[
-                ToolParameter(name="file_name", type="string"),
-                ToolParameter(name="search", type="string"),
-                ToolParameter(name="replace", type="string"),
-            ],
-        ),
-        ToolDefinition(
-            type_id="diff",
-            name="apply_unified_patch",
-            description="Apply a unified-diff patch.",
-            parameters=[ToolParameter(name="patch", type="string")],
+            name="patch",
+            description="Apply an OpenCode patch block.",
+            parameters=[ToolParameter(name="patchText", type="string")],
             blocking=True,
-        ),
-        ToolDefinition(
-            type_id="diff",
-            name="create_file_from_block",
-            description="Create a new file from an OpenCode Add File block.",
-            parameters=[
-                ToolParameter(name="file_name", type="string"),
-                ToolParameter(name="content", type="string"),
-            ],
         ),
     ]
 
@@ -149,5 +130,4 @@ def test_dry_run_bad_code(tmp_path: Path, md_name: str):
         assert lsp_feedback_seen, "Expected LSP feedback/diagnostics in bad code dry run"
     finally:
         ray.shutdown()
-
 

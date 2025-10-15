@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
+import random
 import shutil
+import time
 import uuid
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from types import SimpleNamespace
+from dataclasses import asdict
 
 import ray
 
@@ -26,6 +31,7 @@ from .execution.enhanced_executor import EnhancedToolExecutor
 from .execution.agent_executor import AgentToolExecutor
 from .compilation.tool_yaml_loader import load_yaml_tools
 from .compilation.system_prompt_compiler import get_compiler
+from .provider_ir import IRFinish, IRDeltaEvent
 from .compilation.enhanced_config_validator import EnhancedConfigValidator
 from .provider_routing import provider_router
 from .provider_adapters import provider_adapter_manager
@@ -36,6 +42,7 @@ from .provider_runtime import (
     ProviderMessage,
     ProviderRuntimeError,
 )
+from .provider_capability_probe import ProviderCapabilityProbeRunner
 from .state.session_state import SessionState
 from .state.completion_detector import CompletionDetector
 from .messaging.message_formatter import MessageFormatter
@@ -47,7 +54,12 @@ from .logging_v2.api_recorder import APIRequestRecorder
 from .logging_v2.prompt_logger import PromptArtifactLogger
 from .logging_v2.markdown_transcript import MarkdownTranscriptWriter
 from .logging_v2.provider_native_logger import ProviderNativeLogger
+from .logging_v2.request_recorder import StructuredRequestRecorder
 from .utils.local_ray import LocalActorProxy, identity_get
+from .provider_capability_probe import ProviderCapabilityProbeRunner
+from .provider_health import RouteHealthManager
+from .provider_normalizer import normalize_provider_result
+from .provider_metrics import ProviderMetricsCollector
 
 
 def compute_tool_prompt_mode(tool_prompt_mode: str, will_use_native_tools: bool, config: Dict[str, Any]) -> str:
@@ -201,9 +213,20 @@ class OpenAIConductor:
         except Exception:
             run_dir = ""
         self.api_recorder = APIRequestRecorder(self.logger_v2)
+        self.structured_request_recorder = StructuredRequestRecorder(self.logger_v2)
         self.prompt_logger = PromptArtifactLogger(self.logger_v2)
         self.md_writer = MarkdownTranscriptWriter()
         self.provider_logger = ProviderNativeLogger(self.logger_v2)
+        self.capability_probe_runner = ProviderCapabilityProbeRunner(
+            provider_router,
+            provider_registry,
+            self.logger_v2,
+            None,
+        )
+        self._capability_probes_ran = False
+        self.route_health = RouteHealthManager()
+        self._current_route_id: Optional[str] = None
+        self.provider_metrics = ProviderMetricsCollector()
         
         # Initialize extracted modules
         self.message_formatter = MessageFormatter(self.workspace)
@@ -238,6 +261,232 @@ class OpenAIConductor:
     def _initialize_dialect_manager(self):
         """Initialize enhanced tools and configuration validator"""
         self.dialect_manager = DialectManager(self.config)
+
+    def _get_model_routing_preferences(self, route_id: Optional[str]) -> Dict[str, Any]:
+        """Return routing preferences for a given configured route."""
+        defaults = {
+            "disable_stream_on_probe_failure": True,
+            "disable_native_tools_on_probe_failure": True,
+            "fallback_models": [],
+        }
+        providers_cfg = (self.config.get("providers") or {})
+        if not route_id:
+            provider_defaults = providers_cfg.get("routing") or providers_cfg.get("routing_preferences") or {}
+            prefs = dict(defaults)
+            for key, value in (provider_defaults.items() if isinstance(provider_defaults, dict) else []):
+                if value is not None:
+                    prefs[key] = value
+            return prefs
+
+        models_cfg = providers_cfg.get("models") or []
+        for entry in models_cfg:
+            if entry.get("id") == route_id:
+                routing_cfg = entry.get("routing") or entry.get("routing_preferences") or {}
+                prefs = dict(defaults)
+                for key, value in (routing_cfg.items() if isinstance(routing_cfg, dict) else []):
+                    if value is not None:
+                        prefs[key] = value
+                return prefs
+
+        provider_defaults = providers_cfg.get("routing") or providers_cfg.get("routing_preferences") or {}
+        prefs = dict(defaults)
+        for key, value in (provider_defaults.items() if isinstance(provider_defaults, dict) else []):
+            if value is not None:
+                prefs[key] = value
+        return prefs
+
+    def _get_capability_probe_result(
+        self,
+        session_state: SessionState,
+        route_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch previously recorded capability probe result for a route."""
+        if not route_id:
+            return None
+        try:
+            probes = session_state.get_provider_metadata("capability_probes", [])
+        except Exception:
+            probes = []
+        if not probes:
+            return None
+        for entry in probes:
+            if entry.get("model_id") == route_id:
+                return entry
+        return None
+
+    def _log_routing_event(
+        self,
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+        *,
+        turn_index: Optional[Any],
+        tag: str,
+        message: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """Emit routing-related diagnostic across transcript, markdown, and IR."""
+        try:
+            session_state.add_transcript_entry({tag: payload})
+        except Exception:
+            pass
+        try:
+            markdown_logger.log_system_message(message)
+        except Exception:
+            pass
+        try:
+            if getattr(self.logger_v2, "run_dir", None):
+                self.logger_v2.append_text(
+                    "conversation/conversation.md",
+                    self.md_writer.system(message),
+                )
+        except Exception:
+            pass
+        cursor: str
+        if isinstance(turn_index, int) and turn_index >= 0:
+            cursor = f"turn_{turn_index}:{tag}"
+        elif isinstance(turn_index, str):
+            cursor = f"{turn_index}:{tag}"
+        else:
+            cursor = tag
+        try:
+            session_state.add_ir_event(
+                IRDeltaEvent(
+                    cursor=cursor,
+                    type="reasoning_meta",
+                    payload=dict(payload, message=message),
+                )
+            )
+        except Exception:
+            pass
+
+    def _record_stream_policy_metadata(self, session_state: SessionState, policy: Dict[str, Any]) -> None:
+        """Store stream policy decisions in session metadata."""
+        try:
+            history = session_state.get_provider_metadata("stream_policy_history", [])
+        except Exception:
+            history = []
+        try:
+            if isinstance(history, list):
+                updated_history = list(history)
+            else:
+                updated_history = [history] if history else []
+            updated_history.append(policy)
+            session_state.set_provider_metadata("stream_policy_history", updated_history)
+            session_state.set_provider_metadata("last_stream_policy", policy)
+        except Exception:
+            pass
+
+    def _apply_capability_tool_overrides(
+        self,
+        provider_tools_cfg: Dict[str, Any],
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+    ) -> Dict[str, Any]:
+        """Adjust native tool usage based on capability probe outputs."""
+        route_id = getattr(self, "_current_route_id", None)
+        routing_prefs = self._get_model_routing_preferences(route_id)
+        if not routing_prefs.get("disable_native_tools_on_probe_failure", True):
+            return provider_tools_cfg
+        capability = self._get_capability_probe_result(session_state, route_id)
+        if not capability or not capability.get("attempted"):
+            return provider_tools_cfg
+        if capability.get("tool_stream_success") is not False:
+            return provider_tools_cfg
+        # Respect explicit overrides favoring native tools when set to False already
+        current_override = provider_tools_cfg.get("use_native")
+        if current_override is False:
+            return provider_tools_cfg
+        updated_cfg = dict(provider_tools_cfg)
+        updated_cfg["use_native"] = False
+        payload = {
+            "route": route_id,
+            "capabilities": {
+                "stream_success": capability.get("stream_success"),
+                "tool_stream_success": capability.get("tool_stream_success"),
+                "json_mode_success": capability.get("json_mode_success"),
+            },
+            "reason": "capability_probe_tool_failure",
+        }
+        message = (
+            f"[tool-policy] Disabled native tool usage for route '{route_id}' after capability probe failure."
+        )
+        self.provider_metrics.add_tool_override(
+            route=route_id,
+            reason="capability_probe_tool_failure",
+        )
+        self._log_routing_event(
+            session_state,
+            markdown_logger,
+            turn_index="setup",
+            tag="tool_policy",
+            message=message,
+            payload=payload,
+        )
+        try:
+            history = session_state.get_provider_metadata("tool_policy_history", [])
+            if isinstance(history, list):
+                updated_history = list(history)
+            else:
+                updated_history = [history] if history else []
+            updated_history.append(
+                {
+                    "route": route_id,
+                    "reason": "capability_probe_tool_failure",
+                    "ts": time.time(),
+                }
+            )
+            session_state.set_provider_metadata("tool_policy_history", updated_history)
+        except Exception:
+            pass
+        return updated_cfg
+
+    def _select_fallback_route(
+        self,
+        primary_route: Optional[str],
+        provider_id: Optional[str],
+        primary_model: str,
+        explicit_candidates: List[str],
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Choose a fallback route honoring routing prefs and route health."""
+        ordered: List[str] = []
+        skipped: List[Dict[str, Any]] = []
+        seen = set()
+
+        def add_candidate(candidate: Optional[str]) -> None:
+            if not candidate:
+                return
+            if candidate in seen:
+                return
+            seen.add(candidate)
+            ordered.append(candidate)
+
+        for item in explicit_candidates or []:
+            add_candidate(str(item))
+
+        if provider_id == "openrouter":
+            try:
+                _, base_model, _ = provider_router.get_provider_config(primary_route or primary_model)
+            except Exception:
+                base_model = None
+            if base_model and base_model.startswith("openai/"):
+                add_candidate(base_model)
+            add_candidate("openrouter/openai/gpt-4o-mini")
+            add_candidate("gpt-4o-mini")
+        elif provider_id == "openai":
+            add_candidate("gpt-4o-mini")
+
+        for candidate in ordered:
+            try:
+                descriptor, resolved = provider_router.get_runtime_descriptor(candidate)
+            except Exception:
+                skipped.append({"route": candidate, "reason": "descriptor_lookup_failed"})
+                continue
+            if self.route_health.is_circuit_open(candidate) or self.route_health.is_circuit_open(resolved):
+                skipped.append({"route": candidate, "reason": "circuit_open"})
+                continue
+            return candidate, {"candidates": ordered, "skipped": skipped, "selected": candidate}
+
+        return None, {"candidates": ordered, "skipped": skipped, "selected": None}
     
     # ===== Agent Schema v2 helpers =====
     def _resolve_active_mode(self) -> Optional[str]:
@@ -397,28 +646,36 @@ class OpenAIConductor:
         try:
             if not getattr(self, "yaml_tools", None):
                 return None
-            
-            # Get enabled tools from config
-            enabled_tools = self.config.get("tools", {}).get("enabled", {})
-            if not enabled_tools:
-                return None
-            
+
+            # Prefer Schema V2 registry.include if present; else fall back to legacy tools.enabled
+            tools_cfg = (self.config.get("tools", {}) or {})
+            registry_cfg = (tools_cfg.get("registry", {}) or {})
+            include_list = list(registry_cfg.get("include") or [])
+            legacy_enabled = (tools_cfg.get("enabled", {}) or {})
+
+            def _is_included(name: str) -> bool:
+                if include_list:
+                    return name in include_list
+                if legacy_enabled:
+                    return bool(legacy_enabled.get(name, False))
+                # If neither specified, include everything
+                return True
+
             converted: List[ToolDefinition] = []
             for t in self.yaml_tools:
-                # Only include tools that are enabled in config
-                if not enabled_tools.get(t.name, False):
+                name = getattr(t, "name", None)
+                if not name or not _is_included(name):
                     continue
-                    
                 params = []
                 for p in getattr(t, "parameters", []) or []:
                     params.append(ToolParameter(name=p.name, type=p.type, description=p.description, default=p.default))
                 converted.append(
                     ToolDefinition(
                         type_id=getattr(t, "type_id", "python"),
-                        name=t.name,
-                        description=t.description,
+                        name=name,
+                        description=getattr(t, "description", ""),
                         parameters=params,
-                        blocking=getattr(t, "blocking", False),
+                        blocking=bool(getattr(t, "blocking", False)),
                     )
                 )
             return converted if converted else None
@@ -590,8 +847,15 @@ class OpenAIConductor:
                 self.logger_v2.write_text("conversation/conversation.md", "# Conversation Transcript\n")
         except Exception:
             pass
-        telemetry = TelemetryLogger(os.environ.get("RAYCODE_TELEMETRY_PATH"))
+        telemetry_path = os.environ.get("RAYCODE_TELEMETRY_PATH")
+        if not telemetry_path and getattr(self.logger_v2, "run_dir", None):
+            telemetry_path = str(Path(self.logger_v2.run_dir) / "meta" / "telemetry.jsonl")
+        telemetry = TelemetryLogger(telemetry_path)
+        self._active_telemetry_logger = telemetry
         error_handler = ErrorHandler(output_json_path)
+
+        self._ensure_capability_probes(session_state, markdown_logger)
+        self.provider_metrics.reset()
         
         # Clear existing log files
         for del_path in [output_md_path, output_json_path]:
@@ -599,9 +863,10 @@ class OpenAIConductor:
                 os.remove(del_path)
         
         # Initialize provider and client
-        provider_config, resolved_model, supports_native_tools_for_model = provider_router.get_provider_config(model)
-        runtime_descriptor, runtime_model = provider_router.get_runtime_descriptor(model)
-        client_config = provider_router.create_client_config(model)
+        requested_route_id = model
+        provider_config, resolved_model, supports_native_tools_for_model = provider_router.get_provider_config(requested_route_id)
+        runtime_descriptor, runtime_model = provider_router.get_runtime_descriptor(requested_route_id)
+        client_config = provider_router.create_client_config(requested_route_id)
 
         provider_tools_cfg = dict((self.config.get("provider_tools") or {}))
         api_variant_override = provider_tools_cfg.get("api_variant")
@@ -626,11 +891,21 @@ class OpenAIConductor:
             default_headers=client_config.get("default_headers"),
         )
 
+        self._current_route_id = requested_route_id
+        try:
+            session_state.set_provider_metadata("route_id", requested_route_id)
+        except Exception:
+            pass
         model = runtime_model  # Update model to resolved version for API calls
         session_state.set_provider_metadata("provider_id", runtime_descriptor.provider_id)
         session_state.set_provider_metadata("runtime_id", runtime_descriptor.runtime_id)
         session_state.set_provider_metadata("api_variant", runtime_descriptor.default_api_variant)
         session_state.set_provider_metadata("resolved_model", runtime_model)
+        try:
+            capabilities = provider_router.get_capabilities(model)
+            session_state.set_provider_metadata("capabilities", asdict(capabilities))
+        except Exception:
+            pass
         
         # Defer initial message creation until after tool/dialect resolution so we can compile prompts correctly
         per_turn_prompt = ""
@@ -722,6 +997,11 @@ class OpenAIConductor:
         provider_tools_cfg = dict(provider_tools_cfg)
         if provider_tools_cfg.get("use_native") is None and native_pref_hint is not None:
             provider_tools_cfg["use_native"] = native_pref_hint
+        provider_tools_cfg = self._apply_capability_tool_overrides(
+            provider_tools_cfg,
+            session_state,
+            markdown_logger,
+        )
         effective_config = dict(self.config)
         effective_config["provider_tools"] = provider_tools_cfg
         self._provider_tools_effective = provider_tools_cfg
@@ -760,8 +1040,10 @@ class OpenAIConductor:
         session_state.write_snapshot(output_json_path, model)
         
         # Main agentic loop - significantly simplified
+        run_result = None
+        run_loop_error: Optional[Dict[str, Any]] = None
         try:
-            return self._run_main_loop(
+            run_result = self._run_main_loop(
                 runtime,
                 client,
                 model,
@@ -778,8 +1060,74 @@ class OpenAIConductor:
                 stream_responses,
                 local_tools_prompt,
             )
+        except Exception as exc:
+            run_loop_error = {
+                "type": exc.__class__.__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            session_state.add_transcript_entry({"run_loop_exception": run_loop_error})
+            try:
+                session_state.set_provider_metadata("run_loop_exception", run_loop_error)
+            except Exception:
+                pass
+            try:
+                if self.logger_v2.run_dir:
+                    self.logger_v2.write_json("errors/run_loop_exception.json", run_loop_error)
+            except Exception:
+                pass
         finally:
             self._persist_final_workspace()
+            try:
+                active_logger = getattr(self, "_active_telemetry_logger", None)
+                if active_logger:
+                    active_logger.close()
+            except Exception:
+                pass
+            self._active_telemetry_logger = None
+        # Defensive: always return a dict result
+        if not isinstance(run_result, dict):
+            completion_summary = session_state.completion_summary or {}
+            completion_summary.setdefault("completed", False)
+            if run_loop_error is not None:
+                completion_summary["reason"] = "run_loop_exception"
+                completion_summary["error"] = run_loop_error
+            else:
+                completion_summary.setdefault("reason", "no_result")
+            session_state.completion_summary = completion_summary
+            run_result = {
+                "messages": session_state.messages,
+                "transcript": session_state.transcript,
+                "completion_summary": completion_summary,
+                "completion_reason": completion_summary.get("reason", "no_result"),
+                "completed": bool(completion_summary.get("completed", False)),
+            }
+
+        # Populate finish metadata for IR and persist conversation snapshot
+        usage_payload = session_state.get_provider_metadata("usage")
+        if not isinstance(usage_payload, dict):
+            usage_payload = {}
+        finish_reason = "stop" if run_result.get("completed") else "error"
+        finish_meta = session_state.get_provider_metadata("raw_finish_meta")
+        agent_summary = copy.deepcopy(session_state.completion_summary or {})
+        session_state.set_ir_finish(
+            IRFinish(
+                reason=finish_reason,
+                usage=usage_payload,
+                provider_meta=finish_meta,
+                agent_summary=agent_summary,
+            )
+        )
+
+        try:
+            if self.logger_v2.run_dir:
+                conv_id = os.path.basename(self.logger_v2.run_dir)
+                conversation_ir = session_state.build_conversation_ir(conversation_id=conv_id)
+                self.logger_v2.write_json("meta/conversation_ir.json", asdict(conversation_ir))
+        except Exception:
+            pass
+
+        return run_result
     
     def _persist_final_workspace(self) -> None:
         """Copy the final workspace into the run's log directory if available."""
@@ -1120,11 +1468,36 @@ class OpenAIConductor:
         # Apply v2 mode gating and loop turn strategy
         if int(self.config.get("version", 0)) == 2:
             active_mode = self._resolve_active_mode()
+            loop_cfg = (self.config.get("loop", {}) or {})
+            plan_limit = 0
+            plan_turns: Optional[int] = None
+            try:
+                plan_limit = int(loop_cfg.get("plan_turn_limit") or 0)
+            except Exception:
+                plan_limit = 0
+            if active_mode == "plan" and plan_limit:
+                existing = session_state.get_provider_metadata("plan_turns", 0)
+                plan_turns = int(existing) + 1
+                session_state.set_provider_metadata("plan_turns", plan_turns)
+                session_state.set_provider_metadata("plan_turn_limit", plan_limit)
             mode_cfg = self._get_mode_config(active_mode)
             if mode_cfg:
                 prompt_tool_defs = self._filter_tools_by_mode(prompt_tool_defs, mode_cfg)
+            if active_mode == "plan" and plan_limit and plan_turns is not None and plan_turns >= plan_limit:
+                features_cfg = self.config.setdefault("features", {})
+                if features_cfg.get("plan", True):
+                    features_cfg["plan"] = False
+                    session_state.set_provider_metadata("plan_mode_disabled", True)
+                    session_state.add_transcript_entry({
+                        "mode_transition": {
+                            "from": "plan",
+                            "to": "build",
+                            "reason": "plan_turn_limit",
+                            "plan_turns": plan_turns,
+                        }
+                    })
             self._apply_turn_strategy_from_loop()
-        
+
         if tool_prompt_mode == "system_compiled_and_persistent_per_turn":
             # NEW MODE: Use comprehensive cached system prompt + small per-turn availability
             compiler = get_compiler()
@@ -1249,6 +1622,76 @@ class OpenAIConductor:
         
         completed = False
         step_index = -1
+
+        def finalize_run(
+            exit_kind_value: str,
+            default_reason: str,
+            extra_payload: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
+            """Finalize loop execution by recording summary, snapshot, and return payload."""
+
+            steps_taken = (step_index + 1) if step_index >= 0 else 0
+            summary: Dict[str, Any] = dict(session_state.completion_summary or {})
+            summary.setdefault("completed", completed)
+            if default_reason and "reason" not in summary:
+                summary["reason"] = default_reason
+            if "method" not in summary:
+                summary["method"] = "provider_error" if exit_kind_value == "provider_error" else "loop_exit"
+            summary["exit_kind"] = exit_kind_value
+            summary["steps_taken"] = steps_taken
+            summary["max_steps"] = max_steps
+            session_state.completion_summary = summary
+            session_state.set_provider_metadata("final_state", summary)
+            session_state.set_provider_metadata("exit_kind", exit_kind_value)
+            session_state.set_provider_metadata("steps_taken", steps_taken)
+            session_state.set_provider_metadata("max_steps", max_steps)
+
+            metrics_snapshot = self.provider_metrics.snapshot()
+            try:
+                session_state.set_provider_metadata("provider_metrics", metrics_snapshot)
+            except Exception:
+                pass
+            if getattr(self.logger_v2, "run_dir", None):
+                try:
+                    self.logger_v2.write_json("meta/provider_metrics.json", metrics_snapshot)
+                except Exception:
+                    pass
+            telemetry_logger = getattr(self, "_active_telemetry_logger", None)
+            if telemetry_logger:
+                try:
+                    telemetry_logger.log(
+                        {
+                            "event": "provider_metrics",
+                            "summary": metrics_snapshot.get("summary", {}),
+                            "routes": metrics_snapshot.get("routes", {}),
+                            "fallbacks": metrics_snapshot.get("fallbacks", []),
+                            "stream_overrides": metrics_snapshot.get("stream_overrides", []),
+                            "tool_overrides": metrics_snapshot.get("tool_overrides", []),
+                        }
+                    )
+                except Exception:
+                    pass
+
+            try:
+                diff = self.vcs({"action": "diff", "params": {"staged": False, "unified": 3}})
+            except Exception:
+                diff = {"ok": False, "data": {"diff": ""}}
+
+            session_state.write_snapshot(output_json_path, model, diff)
+            if stream_responses:
+                reason_label = summary.get("reason", default_reason or "unknown")
+                print(f"[stop] reason={reason_label} steps={steps_taken} exit={exit_kind_value}")
+
+            result_payload: Dict[str, Any] = {
+                "messages": session_state.messages,
+                "transcript": session_state.transcript,
+                "completion_summary": summary,
+                "completion_reason": summary.get("reason", default_reason or "unknown"),
+                "completed": summary.get("completed", False),
+            }
+            if extra_payload:
+                result_payload.update(extra_payload)
+            return result_payload
 
         for step_index in range(max_steps):
             try:
@@ -1376,11 +1819,11 @@ class OpenAIConductor:
                     pass
                 try:
                     if getattr(self.logger_v2, "run_dir", None):
-                        turn_idx = len(session_state.transcript) + 1
-                        self.logger_v2.write_json(
-                            f"errors/turn_{turn_idx}.json",
-                            result,
+                        turn_idx = session_state.get_provider_metadata(
+                            "current_turn_index",
+                            len(session_state.transcript) + 1,
                         )
+                        self._persist_error_artifacts(turn_idx, result)
                 except Exception:
                     pass
                 try:
@@ -1397,7 +1840,482 @@ class OpenAIConductor:
                         print(f"Provider response snippet: {snippet}")
                 except Exception:
                     pass
-                return result
+                summary = dict(session_state.completion_summary or {})
+                summary.setdefault("completed", False)
+                if result.get("error_type"):
+                    summary.setdefault("reason", result.get("error_type"))
+                    summary.setdefault("error_type", result.get("error_type"))
+                else:
+                    summary.setdefault("reason", "provider_error")
+                if result.get("hint"):
+                    summary.setdefault("hint", result.get("hint"))
+                summary.setdefault("method", "provider_error")
+                session_state.completion_summary = summary
+                extra_payload = {
+                    "provider_error": result,
+                    "error": result.get("error"),
+                    "error_type": result.get("error_type"),
+                    "hint": result.get("hint"),
+                    "details": result.get("details"),
+                }
+                completed = False
+                return finalize_run("provider_error", summary.get("reason", "provider_error"), extra_payload)
+
+        # Post-loop finalization for successful or exhausted runs
+        steps_taken = (step_index + 1) if step_index >= 0 else 0
+        if not session_state.completion_summary:
+            if completed:
+                reason = "completion_detected"
+            elif max_steps and steps_taken >= max_steps:
+                reason = "max_steps_exhausted"
+            else:
+                reason = "loop_terminated"
+            session_state.completion_summary = {
+                "completed": completed,
+                "reason": reason,
+                "method": "loop_exit",
+            }
+
+        default_reason = session_state.completion_summary.get("reason", "loop_terminated")
+        return finalize_run("loop_exit", default_reason)
+
+    def _apply_streaming_policy_for_turn(
+        self,
+        runtime,
+        model: str,
+        tools_schema: Optional[List[Dict[str, Any]]],
+        stream_requested: bool,
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+        turn_index: int,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Apply provider-specific streaming policy for the current turn."""
+
+        effective_stream = stream_requested
+        policy: Optional[Dict[str, Any]] = None
+        descriptor = getattr(runtime, "descriptor", None)
+        provider_id = getattr(descriptor, "provider_id", None)
+        runtime_id = getattr(descriptor, "runtime_id", None)
+
+        if stream_requested and tools_schema and provider_id == "openrouter":
+            effective_stream = False
+            policy = {
+                "turn_index": turn_index,
+                "model": model,
+                "provider": provider_id,
+                "runtime": runtime_id,
+                "reason": "openrouter_tool_turn_policy",
+                "stream_requested": True,
+                "stream_effective": False,
+            }
+            self.provider_metrics.add_stream_override(
+                route=getattr(self, "_current_route_id", None),
+                reason="openrouter_tool_turn_policy",
+            )
+            try:
+                session_state.add_transcript_entry({"stream_policy": policy})
+            except Exception:
+                pass
+            note = (
+                "[stream-policy] Forcing stream=false for OpenRouter tool turn "
+                f"(turn={turn_index}, model={model})."
+            )
+            try:
+                markdown_logger.log_system_message(note)
+            except Exception:
+                pass
+            try:
+                if getattr(self.logger_v2, "run_dir", None):
+                    self.logger_v2.append_text(
+                        "conversation/conversation.md",
+                        self.md_writer.system(note),
+                    )
+            except Exception:
+                pass
+        route_id = getattr(self, "_current_route_id", None)
+        capability = self._get_capability_probe_result(session_state, route_id)
+        routing_prefs = self._get_model_routing_preferences(route_id)
+        if (
+            capability
+            and capability.get("attempted")
+            and capability.get("stream_success") is False
+            and effective_stream
+            and routing_prefs.get("disable_stream_on_probe_failure", True)
+        ):
+            effective_stream = False
+            override_payload = {
+                "turn_index": turn_index,
+                "model": model,
+                "provider": provider_id,
+                "runtime": runtime_id,
+                "reason": "capability_probe_stream_failure",
+                "stream_requested": stream_requested,
+                "stream_effective": False,
+                "route_id": route_id,
+            }
+            if policy is None:
+                override_payload["reasons"] = ["capability_probe_stream_failure"]
+                policy = override_payload
+            else:
+                merged = dict(policy)
+                reasons = merged.get("reasons")
+                if not isinstance(reasons, list):
+                    reasons_list: List[str] = []
+                    if merged.get("reason"):
+                        reasons_list.append(merged["reason"])
+                else:
+                    reasons_list = list(reasons)
+                reasons_list.append("capability_probe_stream_failure")
+                merged["reasons"] = reasons_list
+                merged["capability_override"] = True
+                merged["stream_effective"] = False
+                merged["stream_requested"] = stream_requested
+                merged["route_id"] = route_id
+                policy = merged
+            payload = {
+                "route": route_id,
+                "capabilities": {
+                    "stream_success": capability.get("stream_success"),
+                    "tool_stream_success": capability.get("tool_stream_success"),
+                    "json_mode_success": capability.get("json_mode_success"),
+                },
+                "policy": policy,
+            }
+            message = (
+                f"[stream-policy] Disabled streaming for route '{route_id}' based on capability probe results."
+            )
+            self.provider_metrics.add_stream_override(
+                route=route_id,
+                reason="capability_probe_stream_failure",
+            )
+            self._log_routing_event(
+                session_state,
+                markdown_logger,
+                turn_index=turn_index,
+                tag="stream_policy",
+                message=message,
+                payload=payload,
+            )
+            try:
+                session_state.set_provider_metadata("capability_stream_override", {
+                    "route": route_id,
+                    "turn_index": turn_index,
+                    "reason": "capability_probe_stream_failure",
+                })
+            except Exception:
+                pass
+        if policy is not None:
+            self._record_stream_policy_metadata(session_state, policy)
+        return effective_stream, policy
+
+    def _persist_error_artifacts(self, turn_index: int, payload: Dict[str, Any]) -> None:
+        """Persist error payload and associated diagnostics artifacts."""
+
+        run_dir = getattr(self.logger_v2, "run_dir", None)
+        if not run_dir:
+            return
+
+        try:
+            self.logger_v2.write_json(f"errors/turn_{turn_index}.json", payload)
+            details = payload.get("details")
+            if not isinstance(details, dict):
+                return
+            headers = details.get("response_headers")
+            if headers:
+                self.logger_v2.write_json(
+                    f"raw/responses/turn_{turn_index}.headers.json",
+                    headers,
+                )
+            raw_b64 = details.get("raw_body_b64")
+            if raw_b64:
+                self.logger_v2.write_text(
+                    f"raw/responses/turn_{turn_index}.body.b64",
+                    raw_b64,
+                )
+            raw_excerpt = details.get("raw_excerpt")
+            if raw_excerpt:
+                self.logger_v2.write_text(
+                    f"raw/responses/turn_{turn_index}.raw_excerpt.txt",
+                    raw_excerpt,
+                )
+            html_excerpt = details.get("html_excerpt")
+            if html_excerpt:
+                self.logger_v2.write_text(
+                    f"raw/responses/turn_{turn_index}.html_excerpt.txt",
+                    html_excerpt,
+                )
+        except Exception:
+            pass
+
+    def _retry_with_fallback(
+        self,
+        runtime,
+        client,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools_schema: Optional[List[Dict[str, Any]]],
+        runtime_context: ProviderRuntimeContext,
+        *,
+        stream_responses: bool,
+        session_state: SessionState,
+        markdown_logger: MarkdownLogger,
+        attempted: List[Tuple[str, bool, Optional[str]]],
+        last_error: Optional[ProviderRuntimeError],
+    ) -> Optional[ProviderResult]:
+        """Attempt a retry and fallback routing when the primary call fails."""
+
+        descriptor = getattr(runtime, "descriptor", None)
+        provider_id = getattr(descriptor, "provider_id", None)
+        runtime_id = getattr(descriptor, "runtime_id", None)
+
+        def _record_degraded(route_model: str, reason: str) -> None:
+            try:
+                degraded = session_state.get_provider_metadata("degraded_routes", {})
+                if not isinstance(degraded, dict):
+                    degraded = {}
+                info = degraded.get(route_model, {})
+                history = info.get("history", [])
+                if not isinstance(history, list):
+                    history = [history] if history else []
+                history.append(
+                    {
+                        "reason": reason,
+                        "provider": provider_id,
+                        "runtime": runtime_id,
+                        "turn": session_state.get_provider_metadata("current_turn_index"),
+                    }
+                )
+                info.update({
+                    "reason": reason,
+                    "provider": provider_id,
+                    "runtime": runtime_id,
+                    "history": history,
+                })
+                degraded[route_model] = info
+                session_state.set_provider_metadata("degraded_routes", degraded)
+            except Exception:
+                pass
+
+        def _sleep_with_jitter(base: float) -> None:
+            jitter = base * 0.25
+            wait_time = base + random.uniform(-jitter, jitter)
+            if wait_time < 0:
+                wait_time = base
+            try:
+                time.sleep(wait_time)
+            except Exception:
+                pass
+
+        def _simplify_result(result: ProviderResult) -> ProviderResult:
+            return result
+
+        def _invoke(target_model: str) -> ProviderResult:
+            return runtime.invoke(
+                client=client,
+                model=target_model,
+                messages=messages,
+                tools=tools_schema,
+                stream=stream_responses,
+                context=runtime_context,
+            )
+
+        def _log_retry(route_model: str, reason: str, attempt: str) -> None:
+            message = (
+                f"[provider-retry] route={route_model} attempt={attempt} reason={reason}"
+            )
+            try:
+                markdown_logger.log_system_message(message)
+            except Exception:
+                pass
+            try:
+                if getattr(self.logger_v2, "run_dir", None):
+                    self.logger_v2.append_text(
+                        "conversation/conversation.md",
+                        self.md_writer.system(message),
+                    )
+            except Exception:
+                pass
+            try:
+                session_state.add_transcript_entry({
+                    "provider_retry": {
+                        "route": route_model,
+                        "attempt": attempt,
+                        "reason": reason,
+                    }
+                })
+            except Exception:
+                pass
+
+        if last_error and not attempted:
+            self.route_health.record_failure(model, str(last_error))
+            self._update_health_metadata(session_state)
+
+        same_route_reason = str(last_error) if last_error else "retry"
+        backoff_seconds = 0.6
+        _log_retry(model, same_route_reason, "retry")
+        _sleep_with_jitter(backoff_seconds)
+
+        try:
+            result = _invoke(model)
+            attempted.append((model, stream_responses, None))
+            self.route_health.record_success(model)
+            self._update_health_metadata(session_state)
+            return _simplify_result(result)
+        except ProviderRuntimeError as retry_error:
+            attempted.append((model, stream_responses, str(retry_error) or retry_error.__class__.__name__))
+            last_error = retry_error
+            self.route_health.record_failure(model, str(retry_error) or retry_error.__class__.__name__)
+            self._update_health_metadata(session_state)
+
+        route_id = None
+        if runtime_context and isinstance(runtime_context.extra, dict):
+            route_id = runtime_context.extra.get("route_id")
+        routing_prefs = self._get_model_routing_preferences(route_id)
+        explicit_fallbacks = routing_prefs.get("fallback_models") or []
+        fallback_model, fallback_diag = self._select_fallback_route(
+            route_id,
+            provider_id,
+            model,
+            explicit_fallbacks,
+        )
+
+        if not fallback_model:
+            if last_error:
+                raise last_error
+            return None
+
+        fallback_reason = str(last_error) if last_error else "fallback"
+        _record_degraded(model, fallback_reason)
+        _log_retry(fallback_model, fallback_reason, "fallback")
+        self.provider_metrics.add_fallback(primary=model, fallback=fallback_model, reason=fallback_reason)
+        turn_hint = None
+        if runtime_context and isinstance(runtime_context.extra, dict):
+            turn_hint = runtime_context.extra.get("turn_index")
+        self._log_routing_event(
+            session_state,
+            markdown_logger,
+            turn_index=turn_hint,
+            tag="fallback_route",
+            message=(
+                f"[routing] Selected fallback route '{fallback_model}' after '{fallback_reason}'."
+            ),
+            payload={
+                "from": route_id or model,
+                "reason": fallback_reason,
+                "diagnostics": fallback_diag,
+            },
+        )
+
+        try:
+            fallback_runtime_descriptor, fallback_model_resolved = provider_router.get_runtime_descriptor(fallback_model)
+            fallback_runtime = provider_registry.create_runtime(fallback_runtime_descriptor)
+            fallback_client_config = provider_router.create_client_config(fallback_model)
+            fallback_runtime_context = ProviderRuntimeContext(
+                session_state=runtime_context.session_state,
+                agent_config=runtime_context.agent_config,
+                stream=False,
+                extra=dict(runtime_context.extra or {}, fallback_of=model, route_id=fallback_model),
+            )
+            fallback_client = fallback_runtime.create_client(
+                fallback_client_config["api_key"],
+                base_url=fallback_client_config.get("base_url"),
+                default_headers=fallback_client_config.get("default_headers"),
+            )
+            try:
+                if getattr(self.logger_v2, "include_structured_requests", True):
+                    turn_idx = runtime_context.extra.get("turn_index") if runtime_context.extra else None
+                    if turn_idx is not None:
+                        try:
+                            turn_for_record = int(turn_idx)
+                        except Exception:
+                            turn_for_record = None
+                    else:
+                        turn_for_record = None
+                    if turn_for_record is not None:
+                        headers_snapshot = dict(fallback_client_config.get("default_headers") or {})
+                        if getattr(fallback_runtime_descriptor, "provider_id", None) == "openrouter":
+                            headers_snapshot.setdefault("Accept", "application/json; charset=utf-8")
+                            headers_snapshot.setdefault("Accept-Encoding", "identity")
+                        self.structured_request_recorder.record_request(
+                            turn_for_record,
+                            provider_id=fallback_runtime_descriptor.provider_id,
+                            runtime_id=fallback_runtime_descriptor.runtime_id,
+                            model=fallback_model_resolved,
+                            request_headers=headers_snapshot,
+                            request_body={
+                                "model": fallback_model_resolved,
+                                "messages": messages,
+                                "tools": tools_schema,
+                                "stream": False,
+                            },
+                            stream=False,
+                            tool_count=len(tools_schema or []),
+                            endpoint=fallback_client_config.get("base_url"),
+                            attempt=len(attempted),
+                            extra={"fallback_of": model},
+                        )
+            except Exception:
+                pass
+            start_ts = time.time()
+            result = fallback_runtime.invoke(
+                client=fallback_client,
+                model=fallback_model_resolved,
+                messages=messages,
+                tools=tools_schema,
+                stream=False,
+                context=fallback_runtime_context,
+            )
+            elapsed = time.time() - start_ts
+            try:
+                self.provider_metrics.add_call(
+                    fallback_model_resolved,
+                    stream=False,
+                    elapsed=elapsed,
+                    outcome="success",
+                )
+            except Exception:
+                pass
+            session_state.set_provider_metadata("fallback_route", {
+                "from": model,
+                "to": fallback_model,
+                "provider": fallback_runtime_descriptor.provider_id,
+            })
+            self.route_health.record_success(fallback_model)
+            self._update_health_metadata(session_state)
+            return result
+        except Exception as exc:
+            elapsed = time.time() - start_ts if 'start_ts' in locals() else 0.0
+            try:
+                self.provider_metrics.add_call(
+                    fallback_model,
+                    stream=False,
+                    elapsed=elapsed,
+                    outcome="error",
+                    error_reason=str(exc),
+                )
+            except Exception:
+                pass
+            attempted.append((fallback_model, False, str(exc) or exc.__class__.__name__))
+            if last_error:
+                raise last_error
+            raise ProviderRuntimeError(str(exc)) from exc
+
+    def _ensure_capability_probes(self, session_state: SessionState, markdown_logger: MarkdownLogger) -> None:
+        if self._capability_probes_ran:
+            return
+        try:
+            self.capability_probe_runner.markdown_logger = markdown_logger
+            self.capability_probe_runner.run(self.config, session_state)
+        except Exception:
+            pass
+        finally:
+            self._capability_probes_ran = True
+
+    def _update_health_metadata(self, session_state: SessionState) -> None:
+        try:
+            session_state.set_provider_metadata("route_health", self.route_health.snapshot())
+        except Exception:
+            pass
 
     def _invoke_runtime_with_streaming(
         self,
@@ -1415,18 +2333,148 @@ class OpenAIConductor:
 
         fallback_stream_reason: Optional[str] = None
         result: Optional[ProviderResult] = None
-        if stream_responses:
+        last_error: Optional[ProviderRuntimeError] = None
+        success_recorded = False
+
+        if self.route_health.is_circuit_open(model):
+            notice = (
+                f"[circuit-open] Skipping direct call for route {model}; attempting fallback."
+            )
+            self.provider_metrics.add_circuit_skip(model)
             try:
-                result = runtime.invoke(
+                markdown_logger.log_system_message(notice)
+            except Exception:
+                pass
+            try:
+                if getattr(self.logger_v2, "run_dir", None):
+                    self.logger_v2.append_text(
+                        "conversation/conversation.md",
+                        self.md_writer.system(notice),
+                    )
+            except Exception:
+                pass
+            try:
+                session_state.add_transcript_entry({"circuit_open": {"model": model, "notice": notice}})
+            except Exception:
+                pass
+            circuit_error = ProviderRuntimeError("route_circuit_open")
+            fallback_result = self._retry_with_fallback(
+                runtime,
+                client,
+                model,
+                send_messages,
+                tools_schema,
+                runtime_context,
+                stream_responses=False,
+                session_state=session_state,
+                markdown_logger=markdown_logger,
+                attempted=[],
+                last_error=circuit_error,
+            )
+            self._update_health_metadata(session_state)
+            if fallback_result is not None:
+                return fallback_result, False
+            raise circuit_error
+
+        def _is_tool_turn() -> bool:
+            if not tools_schema:
+                return False
+            for msg in reversed(session_state.messages):
+                role = msg.get("role")
+                if role == "assistant":
+                    tool_calls = msg.get("tool_calls") or []
+                    return bool(tool_calls)
+                if role == "user":
+                    break
+            return False
+
+        attempted_models = []
+
+        def _call_runtime(target_model: str, use_stream: bool) -> ProviderResult:
+            start_time = time.time()
+            try:
+                call_result = runtime.invoke(
                     client=client,
-                    model=model,
+                    model=target_model,
                     messages=send_messages,
                     tools=tools_schema,
-                    stream=True,
+                    stream=use_stream,
                     context=runtime_context,
                 )
+                elapsed = time.time() - start_time
+                self.provider_metrics.add_call(
+                    target_model,
+                    stream=use_stream,
+                    elapsed=elapsed,
+                    outcome="success",
+                )
+                return call_result
+            except ProviderRuntimeError as exc:
+                elapsed = time.time() - start_time
+                details = getattr(exc, "details", None)
+                html_detected = False
+                if isinstance(details, dict):
+                    html_detected = bool(details.get("html_detected"))
+                self.provider_metrics.add_call(
+                    target_model,
+                    stream=use_stream,
+                    elapsed=elapsed,
+                    outcome="error",
+                    error_reason=str(exc),
+                    html_detected=html_detected,
+                    details=details if isinstance(details, dict) else None,
+                )
+                raise
+
+        def _maybe_disable_stream(reason: str) -> None:
+            try:
+                session_state.set_provider_metadata("streaming_disabled", True)
+            except Exception:
+                pass
+            warning_payload = {
+                "provider": runtime.descriptor.provider_id,
+                "runtime": runtime.descriptor.runtime_id,
+                "reason": reason,
+            }
+            try:
+                session_state.add_transcript_entry({"streaming_disabled": warning_payload})
+            except Exception:
+                pass
+            warning_text = (
+                "[streaming-disabled] "
+                f"Provider {runtime.descriptor.provider_id} ({runtime.descriptor.runtime_id}) "
+                f"rejected streaming: {reason}. Falling back to non-streaming."
+            )
+            try:
+                markdown_logger.log_system_message(warning_text)
+            except Exception:
+                pass
+            try:
+                if getattr(self.logger_v2, "run_dir", None):
+                    self.logger_v2.append_text(
+                        "conversation/conversation.md",
+                        self.md_writer.system(warning_text),
+                    )
+            except Exception:
+                pass
+            try:
+                print(warning_text)
+            except Exception:
+                pass
+
+        if stream_responses:
+            try:
+                result = _call_runtime(model, True)
+                attempted_models.append((model, True, None))
+                self.route_health.record_success(model)
+                success_recorded = True
+                self._update_health_metadata(session_state)
             except ProviderRuntimeError as exc:
                 fallback_stream_reason = str(exc) or exc.__class__.__name__
+                last_error = exc
+                attempted_models.append((model, True, fallback_stream_reason))
+                self.route_health.record_failure(model, fallback_stream_reason)
+                self._update_health_metadata(session_state)
 
         used_streaming = stream_responses and result is not None
 
@@ -1437,6 +2485,10 @@ class OpenAIConductor:
                     "runtime": runtime.descriptor.runtime_id,
                     "reason": fallback_stream_reason,
                 }
+                self.provider_metrics.add_stream_override(
+                    route=getattr(self, "_current_route_id", None),
+                    reason=fallback_stream_reason,
+                )
                 session_state.add_transcript_entry({"streaming_disabled": warning_payload})
                 warning_text = (
                     "[streaming-disabled] "
@@ -1463,15 +2515,59 @@ class OpenAIConductor:
                     print(warning_text)
                 except Exception:
                     pass
-            result = runtime.invoke(
-                client=client,
-                model=model,
-                messages=send_messages,
-                tools=tools_schema,
-                stream=False,
-                context=runtime_context,
+            try:
+                result = _call_runtime(model, False)
+                attempted_models.append((model, False, None))
+                used_streaming = False
+                self.route_health.record_success(model)
+                success_recorded = True
+                self._update_health_metadata(session_state)
+            except ProviderRuntimeError as exc:
+                last_error = exc
+                attempted_models.append((model, False, str(exc) or exc.__class__.__name__))
+                result = None
+                self.route_health.record_failure(model, str(exc) or exc.__class__.__name__)
+                self._update_health_metadata(session_state)
+
+        if result is None and _is_tool_turn():
+            history = session_state.get_provider_metadata("streaming_disabled")
+            if not history:
+                reason_text = str(last_error) if last_error else "tool_turn_retry"
+                _maybe_disable_stream(reason_text)
+
+        if result is None:
+            fallback_result = self._retry_with_fallback(
+                runtime,
+                client,
+                model,
+                send_messages,
+                tools_schema,
+                runtime_context,
+                stream_responses=False,
+                session_state=session_state,
+                markdown_logger=markdown_logger,
+                attempted=attempted_models,
+                last_error=last_error,
             )
-            used_streaming = False
+            if fallback_result is not None:
+                result = fallback_result
+                used_streaming = False
+                success_recorded = True
+            elif last_error:
+                raise last_error
+
+
+        try:
+            if result is not None:
+                session_state.set_provider_metadata("raw_finish_meta", result.metadata)
+        except Exception:
+            pass
+
+        if result is not None and not success_recorded:
+            self.route_health.record_success(model)
+            self._update_health_metadata(session_state)
+        else:
+            self._update_health_metadata(session_state)
 
         return result, used_streaming
 
@@ -1533,6 +2629,10 @@ class OpenAIConductor:
         
         # Add tool prompts based on mode
         turn_index = len(session_state.transcript) + 1
+        try:
+            session_state.set_provider_metadata("current_turn_index", turn_index)
+        except Exception:
+            pass
         per_turn_written_text = None
         if tool_prompt_mode in ("per_turn_append", "system_and_per_turn"):
             # Build full tool directive text (restored from original logic)
@@ -1610,27 +2710,90 @@ class OpenAIConductor:
             except Exception:
                 tools_schema = None
         
+        effective_stream_responses, stream_policy = self._apply_streaming_policy_for_turn(
+            runtime,
+            model,
+            tools_schema,
+            stream_responses,
+            session_state,
+            markdown_logger,
+            turn_index,
+        )
+        try:
+            session_state.set_provider_metadata("current_stream_requested", stream_responses)
+            session_state.set_provider_metadata("current_stream_effective", effective_stream_responses)
+        except Exception:
+            pass
+
         # Persist raw request (pre-call)
         try:
             if self.logger_v2.include_raw:
-                self.api_recorder.save_request(len(session_state.transcript) + 1, {
+                self.api_recorder.save_request(turn_index, {
                     "model": model,
                     "messages": send_messages,
                     "tools": tools_schema,
+                    "stream": effective_stream_responses,
                 })
         except Exception:
             pass
 
         # Make API call
+        runtime_extra = {
+            "turn_index": turn_index,
+            "model": model,
+            "stream": effective_stream_responses,
+            "route_id": self._current_route_id,
+        }
+        if stream_policy is not None:
+            runtime_extra["stream_policy"] = stream_policy
+
         runtime_context = ProviderRuntimeContext(
             session_state=session_state,
             agent_config=self.config,
-            stream=stream_responses,
-            extra={
-                "turn_index": len(session_state.transcript) + 1,
-                "model": model,
-            },
+            stream=effective_stream_responses,
+            extra=runtime_extra,
         )
+
+        # Persist structured request snapshot for incident response triage
+        try:
+            request_headers = dict(client_config.get("default_headers") or {})
+            if getattr(runtime, "descriptor", None) and getattr(runtime.descriptor, "provider_id", None) == "openrouter":
+                request_headers.setdefault("Accept", "application/json; charset=utf-8")
+                request_headers.setdefault("Accept-Encoding", "identity")
+        except Exception:
+            request_headers = {}
+
+        try:
+            if getattr(self.logger_v2, "include_structured_requests", True):
+                extra_meta: Dict[str, Any] = {
+                    "message_count": len(send_messages or []),
+                    "has_tools": bool(tools_schema),
+                }
+                if stream_policy:
+                    extra_meta["stream_policy"] = {
+                        "reason": stream_policy.get("reason"),
+                        "stream_effective": stream_policy.get("stream_effective"),
+                    }
+                self.structured_request_recorder.record_request(
+                    turn_index,
+                    provider_id=getattr(runtime.descriptor, "provider_id", "unknown"),
+                    runtime_id=getattr(runtime.descriptor, "runtime_id", "unknown"),
+                    model=model,
+                    request_headers=request_headers,
+                    request_body={
+                        "model": model,
+                        "messages": send_messages,
+                        "tools": tools_schema,
+                        "stream": effective_stream_responses,
+                    },
+                    stream=effective_stream_responses,
+                    tool_count=len(tools_schema or []),
+                    endpoint=client_config.get("base_url"),
+                    attempt=0,
+                    extra=extra_meta,
+                )
+        except Exception:
+            pass
 
         result, _ = self._invoke_runtime_with_streaming(
             runtime,
@@ -1638,12 +2801,89 @@ class OpenAIConductor:
             model,
             send_messages,
             tools_schema,
-            stream_responses,
+            effective_stream_responses,
             runtime_context,
             session_state,
             markdown_logger,
         )
 
+        if (self.config.get("features", {}) or {}).get("response_normalizer"):
+            try:
+                normalized_events = normalize_provider_result(result)
+                result.metadata.setdefault("normalized_events", normalized_events)
+                session_state.set_provider_metadata("normalized_events", normalized_events)
+                if self.logger_v2.run_dir:
+                    self.logger_v2.write_json(
+                        f"meta/turn_{turn_index}_normalized_events.json",
+                        normalized_events,
+                    )
+            except Exception:
+                pass
+
+        usage_raw = result.usage or {}
+        normalized_usage: Dict[str, Any] = {}
+        if isinstance(usage_raw, dict):
+            prompt_tokens = usage_raw.get("prompt_tokens") or usage_raw.get("input_tokens")
+            completion_tokens = usage_raw.get("completion_tokens") or usage_raw.get("output_tokens")
+            if prompt_tokens is not None:
+                normalized_usage["prompt_tokens"] = prompt_tokens
+            if completion_tokens is not None:
+                normalized_usage["completion_tokens"] = completion_tokens
+            if usage_raw.get("cache_read_tokens") is not None:
+                normalized_usage["cache_read_tokens"] = usage_raw.get("cache_read_tokens")
+            if usage_raw.get("cache_write_tokens") is not None:
+                normalized_usage["cache_write_tokens"] = usage_raw.get("cache_write_tokens")
+            normalized_usage["model"] = model
+        try:
+            session_state.set_provider_metadata("usage_normalized", normalized_usage)
+        except Exception:
+            pass
+
+        cursor_prefix = f"turn_{turn_index}"
+        try:
+            for msg_idx, prov_msg in enumerate(result.messages or []):
+                if prov_msg.content:
+                    session_state.add_ir_event(
+                        IRDeltaEvent(
+                            cursor=f"{cursor_prefix}:text:{msg_idx}",
+                            type="text",
+                            payload={"role": prov_msg.role, "content": prov_msg.content},
+                        )
+                    )
+                if prov_msg.tool_calls:
+                    for tc_idx, tc in enumerate(prov_msg.tool_calls):
+                        session_state.add_ir_event(
+                            IRDeltaEvent(
+                                cursor=f"{cursor_prefix}:tool_call:{msg_idx}:{tc_idx}",
+                                type="tool_call",
+                                payload={
+                                    "id": tc.id,
+                                    "name": tc.name,
+                                    "arguments": tc.arguments,
+                                    "tool_type": tc.type,
+                                },
+                            )
+                        )
+        except Exception:
+            pass
+
+        try:
+            finish_reason = None
+            if result.messages:
+                finish_reason = result.messages[-1].finish_reason
+            session_state.add_ir_event(
+                IRDeltaEvent(
+                    cursor=f"{cursor_prefix}:finish",
+                    type="finish",
+                    payload={
+                        "finish_reason": finish_reason,
+                        "usage": normalized_usage,
+                        "metadata": result.metadata,
+                    },
+                )
+            )
+        except Exception:
+            pass
 
         # Persist raw response (post-call)
         try:
@@ -1659,10 +2899,7 @@ class OpenAIConductor:
                     except Exception:
                         serialized = None
                 if serialized is not None:
-                    self.api_recorder.save_response(
-                        len(session_state.transcript) + 1,
-                        serialized,
-                    )
+                    self.api_recorder.save_response(turn_index, serialized)
         except Exception:
             pass
 

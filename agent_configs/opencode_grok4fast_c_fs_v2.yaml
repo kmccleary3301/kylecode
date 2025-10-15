@@ -3,73 +3,101 @@ extends: base_v2.yaml
 profile: { name: opencode-grok4fast-c-fs }
 
 providers:
-  default_model: openrouter/x-ai/grok-4-fast:free
+  default_model: openrouter/x-ai/grok-4-fast
   models:
-    - id: openrouter/x-ai/grok-4-fast:free
+    - id: openrouter/x-ai/grok-4-fast
       adapter: openai
       params: { temperature: 0.1, top_p: 0.9 }
+      routing:
+        disable_stream_on_probe_failure: true
+        disable_native_tools_on_probe_failure: true
+        fallback_models:
+          - openrouter/openai/gpt-4o-mini
+          - gpt-4o-mini
 
 prompts:
   packs:
     base:
       # system: implementations/system_prompts/opencode/system.md
       system: implementations/system_prompts/default.md
-      # builder: implementations/system_prompts/default.md
-      builder: null
+      plan: implementations/system_prompts/opencode/plan_grok4.md
+      builder: implementations/system_prompts/opencode/builder_grok4.md
+  tool_prompt_mode: system_compiled_and_persistent_per_turn
   tool_prompt_synthesis:
     enabled: true
     dialects:
       pythonic:
         system_full: implementations/tool_prompt_synthesis/pythonic/system_full.j2.md
         per_turn_short: implementations/tool_prompt_synthesis/pythonic/per_turn_short.j2.md
-      unified_diff:
-        system_full: implementations/tool_prompt_synthesis/unified_diff/system_full.j2.md
+      opencode_patch:
+        system_full: implementations/tool_prompt_synthesis/opencode_patch/system_full.j2.md
+        per_turn_short: implementations/tool_prompt_synthesis/opencode_patch/per_turn_short.j2.md
     selection:
       by_model:
         "openrouter/x-ai/*": pythonic
       by_mode:
-        build: unified_diff
+        plan: pythonic
+        build: opencode_patch
     detail:
       system: full
       per_turn: short
 
 tools:
   registry:
-    paths: [implementations/tools/defs_oc]
-    include: ["*"]
+    paths:
+      - implementations/tools/defs_oc
+      - implementations/tools/defs
+    include:
+      - read
+      - read_file
+      - list
+      - list_dir
+      - patch
+      - bash
+      - mark_task_complete
   overlays: []
   aliases: {}
   dialects:
     preference:
-      default: [opencode_patch, unified_diff, bash_block]
+      default: [opencode_patch, bash_block]
       by_model:
         "openrouter/openai/*":
           native: true
-          order: [yaml_command, opencode_patch, unified_diff, bash_block]
+          order: [provider_native, opencode_patch, bash_block]
       by_tool_kind:
-        diff: [opencode_patch, unified_diff]
+        diff: [opencode_patch]
         bash: [provider_native, bash_block]
     selection:
       by_model:
-        "openrouter/openai/*": [opencode_patch, unified_diff, yaml_command]
+        "openrouter/openai/*": [opencode_patch]
       by_tool_kind:
-        diff: [opencode_patch, unified_diff]
+        diff: [opencode_patch]
         bash: [bash_block]
 
 modes:
+  - name: plan
+    prompt: "@pack(base).plan"
+    tools_enabled: [read, read_file, list, list_dir]
+    tools_disabled: [patch, edit, bash, mark_task_complete]
   - name: build
     prompt: "@pack(base).builder"
-    tools_enabled: ["*"]
+    tools_enabled: [read, read_file, list, list_dir, patch, bash, mark_task_complete]
 
 loop:
   sequence:
+    - if: "features.plan"
+      then: { mode: plan }
     - mode: build
   turn_strategy: { relay: tool_role, flow: assistant_continuation }
+  plan_turn_limit: 1
+
+turn_strategy:
+  allow_multiple_per_turn: true
 
 concurrency:
   groups:
-    - { name: edits_and_bash, match_tools: [patch, edit, bash], max_parallel: 1 }
-  nonblocking_tools: [read, read_file, glob, grep, list, list_dir]
+    - { name: edits_and_bash, match_tools: [patch, bash], max_parallel: 1 }
+  nonblocking_tools: [read, read_file, list, list_dir]
 
 completion:
   primary: hybrid
@@ -86,8 +114,4 @@ workspace:
     path: ./agent_ws_opencode
     mode: development
 
-features: { plan: false }
-
-
-
-
+features: { plan: true }
